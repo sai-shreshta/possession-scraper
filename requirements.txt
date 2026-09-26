@@ -1,0 +1,6 @@
+httpx
+beautifulsoup4
+lxml
+pandas
+openpyxl
+playwright  # optional, only for --browser

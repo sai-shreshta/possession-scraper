@@ -1,0 +1,17 @@
+# Secrets - API keys live here
+.env
+
+# Local tool/editor state
+.claude/
+__pycache__/
+*.pyc
+
+# Data, caches and outputs (never commit the building sheets)
+*.xlsx
+*.xlsm
+*.xls
+*.csv
+*.sqlite
+*.sqlite-shm
+*.sqlite-wal
+*.log
