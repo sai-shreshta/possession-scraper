@@ -254,7 +254,7 @@ _NOT_A_PROJECT = [
 ]
 _NAME_NOISE = re.compile(r"\s*[-(]?\s*\bsite\s+visit\b\s*\)?\s*$", re.I)
 # "Bank Auction Property - Anika Apartment" -> search the building itself: "Anika Apartment"
-_NAME_PREFIX = re.compile(r"^\s*(?:bank\s+)?auction\s+(?:property|bazaar)\s*[-:|]\s*", re.I)
+_NAME_PREFIX = re.compile(r"^\s*(?:bank\s+)?auction\s+(?:propert(?:y|ies)|bazaar)\s*[-:|]\s*", re.I)
 
 
 def not_a_project(name: str) -> str:
