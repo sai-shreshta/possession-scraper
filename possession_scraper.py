@@ -249,6 +249,19 @@ def city_from_address(address: str) -> str:
     return ""
 
 
+_NOT_A_PROJECT = [
+    ("PG / paying-guest listing", re.compile(r"^[0-9A-F]{16,}\b|\bPG for\b|\bpaying guest\b", re.I)),
+]
+_NAME_NOISE = re.compile(r"\s*[-(]?\s*\bsite\s+visit\b\s*\)?\s*$", re.I)
+# "Bank Auction Property - Anika Apartment" -> search the building itself: "Anika Apartment"
+_NAME_PREFIX = re.compile(r"^\s*(?:bank\s+)?auction\s+(?:property|bazaar)\s*[-:|]\s*", re.I)
+
+
+def not_a_project(name: str) -> str:
+    """Reason a row is a listing rather than a building (nothing to search), else ''."""
+    return next((why for why, rx in _NOT_A_PROJECT if rx.search(name or "")), "")
+
+
 def row_fields(df: pd.DataFrame, cols: dict, i: int) -> dict:
     """Everything the scraper needs from one sheet row, normalised."""
     def val(key):
@@ -256,7 +269,8 @@ def row_fields(df: pd.DataFrame, cols: dict, i: int) -> dict:
     address = val("locality")
     city = val("city") or city_from_address(address)
     rera_raw = val("rera")
-    return {"name": val("name"), "address": address, "loc": short_locality(address, city), "city": city,
+    return {"name": _NAME_PREFIX.sub("", _NAME_NOISE.sub("", val("name"))).strip(), "address": address,
+            "loc": short_locality(address, city), "city": city,
             "lat": parse_coord(val("lat")), "lon": parse_coord(val("lon")),
             "rera": rera_raw, "rera_ids": split_rera(rera_raw)}
 
@@ -403,6 +417,8 @@ async def reverse_geocode(ctx: Ctx, lat: str, lon: str) -> tuple[str, str]:
             addr = {}
     loc = addr.get("suburb") or addr.get("neighbourhood") or addr.get("quarter") or addr.get("village") or ""
     city = addr.get("city") or addr.get("town") or addr.get("state_district") or addr.get("county") or ""
+    # "Mumbai Suburban District" / "Bengaluru Urban" -> "Mumbai" / "Bengaluru"
+    city = re.sub(r"\s+(suburban|urban|rural|district|division)\b", "", city, flags=re.I).strip()
     ctx.store.put_geo(key, loc, city)
     return loc, city
 
@@ -453,9 +469,13 @@ async def worker(ctx: Ctx, queue: asyncio.Queue, prog: Progress, export_cb):
         try:
             if not name:
                 data = ex.Verdict(note="empty building name").as_dict()
+            elif not_a_project(name):
+                data = {**ex.Verdict(note=f"Skipped: {not_a_project(name)}").as_dict(), "label": "Skipped"}
             else:
-                if not loc and not city and lat and lon:
-                    loc, city = await reverse_geocode(ctx, lat, lon)
+                if not city and lat and lon:
+                    # Short addresses ("Thane West") carry no city; the coordinates do.
+                    g_loc, city = await reverse_geocode(ctx, lat, lon)
+                    loc = loc or g_loc
                 rkey = row_key(name, loc, city)
                 data = ctx.store.by_key(rkey)
                 if data:
@@ -535,7 +555,9 @@ def export(src: Path, sheet, df: pd.DataFrame, results: dict[int, dict], out_she
             r = {v: "" for v in OUT_COLS.values()}
         else:
             r = {OUT_COLS[k]: d.get(k, "") for k in OUT_COLS}
-            if not d.get("found"):
+            if d.get("label") == "Skipped":
+                r["Possession Date"] = "Skipped - not a project"
+            elif not d.get("found"):
                 r["Possession Date"] = "Not found"
         if claude:
             c = claude.get(i)
@@ -578,7 +600,8 @@ def export(src: Path, sheet, df: pd.DataFrame, results: dict[int, dict], out_she
     metrics = [("Rows in sheet", len(df)), ("Rows processed", len(results)),
                ("Date found", sum(1 for d in results.values() if d.get("found"))),
                ("High confidence", labels.count("High")), ("Medium confidence", labels.count("Medium")),
-               ("Low confidence", labels.count("Low")), ("Not found", labels.count("Not found"))]
+               ("Low confidence", labels.count("Low")), ("Not found", labels.count("Not found")),
+               ("Skipped (PG / auction listings)", labels.count("Skipped"))]
     if claude:
         cc = [c.get("confidence") for c in claude.values()]
         metrics += [("Claude reviewed", len(claude)), ("Claude gave a date", sum(1 for c in claude.values() if c.get("iso"))),
