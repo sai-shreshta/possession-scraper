@@ -35,6 +35,8 @@ PREC_FACTOR = {"day": 1.0, "month": 1.0, "quarter": 0.9, "year": 0.65}
 
 # Order matters: earlier alternatives win when they start at the same spot.
 _KEYWORDS = [
+    ("extension", 1.0, r"(?:rera\s+)?extension(?:\s+(?:date|upto|up\s+to|till|until|granted|valid\s+(?:till|upto)))?"
+                       r"|extended\s+(?:up\s*to|till|until|to)"),
     ("rera", 1.0, r"rera\s+(?:possession|completion)(?:\s+date)?|proposed\s+date\s+of\s+completion"
                   r"|revised\s+(?:proposed\s+)?(?:date\s+of\s+)?completion(?:\s+date)?"),
     ("possession", 1.0, r"possession(?:\s+(?:date|starts?|by|from|in|on|time|due|expected|timeline|status))?"),
@@ -48,6 +50,7 @@ _KEYWORDS = [
 ]
 _KW_RE = re.compile("|".join(rf"(?P<{k}>\b(?:{p})\b)" for k, _, p in _KEYWORDS), re.I)
 _KW_WEIGHT = {k: w for k, w, _ in _KEYWORDS}
+RERA_KINDS = ("rera", "extension")
 
 # Anything after these words inside the window describes something other than possession.
 _STOP_RE = re.compile(
@@ -117,7 +120,9 @@ def domain_weight(url: str) -> tuple[float, bool]:
 # ----------------------------------------------------------------------------- name matching
 
 class NameMatcher:
-    def __init__(self, name: str, locality: str, city: str):
+    def __init__(self, name: str, locality: str, city: str, ids: tuple = ()):
+        # RERA IDs: a page quoting the project's registration number is about this project, whatever it calls it.
+        self.ids = [re.sub(r"[^a-z0-9]", "", i.lower()) for i in ids if len(re.sub(r"[^a-z0-9]", "", i.lower())) >= 6]
         toks = [t for t in norm(name).split() if t not in STOPWORDS and (len(t) > 1 or t.isdigit())]
         self.tokens = [(t, 0.5 if (t in GENERIC or t.isdigit()) else 1.0) for t in toks]
         self.total = sum(w for _, w in self.tokens) or 1.0
@@ -143,6 +148,8 @@ class NameMatcher:
         nt = norm(text)
         words = set(nt.split())
         sq = nt.replace(" ", "")
+        if any(i in sq for i in self.ids):
+            return 1.0
         if len(self.squashed) >= 6 and self.squashed in sq:
             s = 1.0
         else:
@@ -282,8 +289,11 @@ def _statuses(text: str) -> Counter:
     return c
 
 
-def from_snippet(title: str, snippet: str, url: str, matcher: NameMatcher) -> tuple[list[Candidate], Counter]:
+def from_snippet(title: str, snippet: str, url: str, matcher: NameMatcher,
+                 pairs_out: list | None = None) -> tuple[list[Candidate], Counter]:
     text = f"{title} . {snippet}"
+    if pairs_out is not None:
+        pairs_out += rera_pairs(text, url, matcher, title)
     match = matcher.score(text)
     if match < 0.6:
         return [], Counter()
@@ -291,8 +301,31 @@ def from_snippet(title: str, snippet: str, url: str, matcher: NameMatcher) -> tu
     out = []
     for kind, _, pd, ctx in _keyword_hits(text):
         s = _KW_WEIGHT[kind] * dw * match * PREC_FACTOR[pd.precision] * 0.85
-        out.append(Candidate(pd.year, pd.month, pd.precision, kind, s, url, _host(url), ctx, gov or kind == "rera"))
+        out.append(Candidate(pd.year, pd.month, pd.precision, kind, s, url, _host(url), ctx, gov or kind in RERA_KINDS))
     return out, _statuses(text)
+
+
+_ORIG = r"(?:original|proposed)(?:\s+proposed)?(?:\s+date\s+of)?\s+completion(?:\s+date)?"
+_REV = r"revised(?:\s+proposed)?(?:\s+date\s+of)?\s+completion(?:\s+date)?"
+_PAIR_RE = re.compile(rf"{_ORIG}\s*[:\-]?\s*(?P<o>.{{0,40}}?)\s*{_REV}\s*[:\-]?\s*(?P<r>.{{0,40}})", re.I)
+
+
+def rera_pairs(text: str, url: str, matcher: "NameMatcher", title: str = "") -> list[dict]:
+    """'Original Completion 31 Dec 2018 ... Revised Completion 30 Jun 2020' as published on RERA mirror pages."""
+    out = []
+    sq_all = norm(f"{url} {text[:20000]}").replace(" ", "")
+    id_match = any(i in sq_all for i in matcher.ids)
+    for m in _PAIR_RE.finditer(text):
+        o, r = parse_first_date(m.group("o")), parse_first_date(m.group("r"))
+        if not o or not r or not o.month or not r.month:
+            continue
+        local = text[max(0, m.start() - 400): m.end() + 100]
+        relevance = 1.0 if id_match else max(matcher.score(title), matcher.score(local))
+        out.append({"orig": (o.year, o.month), "rev": (r.year, r.month), "url": url, "id_match": id_match,
+                    "relevance": relevance, "text": re.sub(r"\s+", " ", m.group(0))[:200]})
+        if len(out) >= 5:
+            break
+    return out
 
 
 def html_to_text(html: str) -> tuple[str, str]:
@@ -307,8 +340,11 @@ def html_to_text(html: str) -> tuple[str, str]:
     return title, text
 
 
-def from_page(html: str, url: str, matcher: NameMatcher) -> tuple[list[Candidate], Counter]:
+def from_page(html: str, url: str, matcher: NameMatcher,
+              pairs_out: list | None = None) -> tuple[list[Candidate], Counter]:
     title, text = html_to_text(html)
+    if pairs_out is not None:
+        pairs_out += rera_pairs(text, url, matcher, title)
     title_match = matcher.score(title)
     about_page = title_match >= 0.8
     dw, gov = domain_weight(url)
@@ -339,7 +375,7 @@ def from_page(html: str, url: str, matcher: NameMatcher) -> tuple[list[Candidate
             near = any(abs(pos - a) <= 300 for a in anchors) and \
                 matcher.score(text[max(0, pos - 300): pos + 300]) >= 0.6
             s = _KW_WEIGHT[kind] * dw * title_match * PREC_FACTOR[pd.precision] * (1.0 if near else 0.4)
-            out.append(Candidate(pd.year, pd.month, pd.precision, kind, s, url, host, ctx, gov or kind == "rera"))
+            out.append(Candidate(pd.year, pd.month, pd.precision, kind, s, url, host, ctx, gov or kind in RERA_KINDS))
             hits += 1
             if hits >= 25:
                 break
@@ -358,7 +394,7 @@ def from_page(html: str, url: str, matcher: NameMatcher) -> tuple[list[Candidate
             if lm < 0.75:
                 continue
             s = _KW_WEIGHT[kind] * dw * lm * PREC_FACTOR[pd.precision] * 0.75
-            out.append(Candidate(pd.year, pd.month, pd.precision, kind, s, url, host, ctx, gov or kind == "rera"))
+            out.append(Candidate(pd.year, pd.month, pd.precision, kind, s, url, host, ctx, gov or kind in RERA_KINDS))
     return out, statuses
 
 
@@ -475,3 +511,33 @@ def aggregate(cands: list[Candidate], statuses: Counter) -> Verdict:
     y, m = top.year, top.month or 12
     v.status = "Under Construction" if (y, m) > (TODAY.year, TODAY.month) else "Ready to Move"
     return v
+
+
+def rera_summary(cands: list[Candidate], pairs: list[dict]) -> dict:
+    """Current RERA completion date, the original one, and whether it was extended.
+    Prefers the Original -> Revised pair from a page quoting the project's RERA ID."""
+    out = {"rera_orig_display": "", "rera_current_iso": "", "rera_current_display": "", "extension_found": "Not found",
+           "rera_evidence": "", "rera_url": "", "rera_alternatives": ""}
+
+    def fmt(ym):
+        return _display(ym[0], ym[1], "month")
+
+    good = [p for p in pairs if p["relevance"] >= 0.75]
+    if good:
+        best = max(good, key=lambda p: (p["id_match"], p["rev"], p["relevance"]))
+        out.update(rera_orig_display=fmt(best["orig"]), rera_current_iso=f"{best['rev'][0]:04d}-{best['rev'][1]:02d}",
+                   rera_current_display=fmt(best["rev"]), rera_evidence=best["text"], rera_url=best["url"],
+                   extension_found=(f"Yes - extended {fmt(best['orig'])} -> {fmt(best['rev'])}"
+                                    if best["rev"] > best["orig"] else "No - revised date same as original"))
+    rera = [c for c in cands if c.is_rera and c.score >= 0.2]
+    if rera:
+        v = aggregate(rera, Counter())
+        if not out["rera_current_iso"]:
+            out.update(rera_current_iso=v.iso, rera_current_display=v.display, rera_evidence=v.evidence,
+                       rera_url=v.best_url)
+        out["rera_alternatives"] = v.alternatives
+        ext = [c for c in rera if c.kind == "extension" and c.score >= 0.35]
+        if ext and out["extension_found"] == "Not found":
+            b = max(ext, key=lambda c: c.score)
+            out["extension_found"] = f"Mentioned: {b.context[:150]}"
+    return out

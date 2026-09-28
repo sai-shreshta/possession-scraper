@@ -95,7 +95,7 @@ class Backend:
         except Disabled as e:
             self.cooldown_until = math.inf
             log.error("%s disabled: %s", self.name, e)
-            raise Blocked() from e
+            raise
         self.strikes = 0
         self.ok += 1
         return res
@@ -224,8 +224,11 @@ class Serper(Backend):
                               headers={"X-API-KEY": self.key, "Content-Type": "application/json"})
         if r.status_code == 429:
             raise Blocked()
-        if r.status_code in (400, 401, 402, 403):
-            raise Disabled(r.text[:200])
+        if r.status_code in (401, 402, 403) or (r.status_code == 400 and "credit" in r.text.lower()):
+            raise Disabled(f"out of credits or key rejected (HTTP {r.status_code}): {r.text[:200]}")
+        if r.status_code == 400:
+            log.debug("serper rejected query %r: %s", q, r.text[:200])
+            return []
         r.raise_for_status()
         return [SearchResult(o.get("title", ""), o.get("link", ""), o.get("snippet", ""))
                 for o in r.json().get("organic", [])]
@@ -276,7 +279,7 @@ class GoogleCSE(Backend):
 FREE_BACKENDS = {"bing": Bing, "duckduckgo": DuckDuckGo, "yahoo": Yahoo, "mojeek": Mojeek}
 
 
-def build_backends(only: list[str] | None = None) -> list[Backend]:
+def build_backends(only: list[str] | None = None, include_free: bool = False) -> list[Backend]:
     bs: list[Backend] = []
     if os.getenv("SERPER_API_KEY"):
         bs.append(Serper(os.environ["SERPER_API_KEY"]))
@@ -284,10 +287,16 @@ def build_backends(only: list[str] | None = None) -> list[Backend]:
         bs.append(Brave(os.environ["BRAVE_API_KEY"]))
     if os.getenv("GOOGLE_CSE_KEY") and os.getenv("GOOGLE_CSE_CX"):
         bs.append(GoogleCSE(os.environ["GOOGLE_CSE_KEY"], os.environ["GOOGLE_CSE_CX"]))
-    bs += [cls() for cls in FREE_BACKENDS.values()]
+    # With a paid key, stay on it (fast, consistent); free engines only when asked or when there is no key.
+    if include_free or not bs or only:
+        bs += [cls() for cls in FREE_BACKENDS.values()]
     if only:
         bs = [b for b in bs if b.name in only]
     return bs
+
+
+class CreditsExhausted(Exception):
+    """A paid search API ran out of credits; the run stops so the key can be swapped and resumed."""
 
 
 class AllBackendsDisabled(Exception):
@@ -295,7 +304,8 @@ class AllBackendsDisabled(Exception):
 
 
 class SearchManager:
-    def __init__(self, backends: list[Backend], cache):
+    def __init__(self, backends: list[Backend], cache, stop_on_exhausted: bool = True):
+        self.stop_on_exhausted = stop_on_exhausted
         self.backends = backends
         self.cache = cache
 
@@ -318,12 +328,18 @@ class SearchManager:
                     return []
                 wake = min(x.cooldown_until for x in self.backends)
                 if wake == math.inf:
+                    if self.stop_on_exhausted and any(x.is_api for x in self.backends):
+                        raise CreditsExhausted("search API key has no credits left")
                     raise AllBackendsDisabled("every search backend is disabled")
                 await asyncio.sleep(max(1.0, min(wake - time.monotonic(), 60)))
                 continue
             try:
                 res = await b.search(client, q)
             except Blocked:
+                continue
+            except Disabled as e:
+                if b.is_api and self.stop_on_exhausted:
+                    raise CreditsExhausted(f"{b.name}: {e}") from e
                 continue
             except (httpx.HTTPError, ValueError) as e:
                 errors += 1

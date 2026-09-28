@@ -47,6 +47,31 @@ With free engines only, expect about 10–20 buildings/min, so 25k rows is rough
 rate-limit are paused and retried automatically. For much faster and more reliable runs, add a search API key in `.env`
 (see `.env.example`). Serper.dev (Google results) works best. About 2–3 searches per building means roughly 60k queries for 25k rows.
 
+## Two modes, one tab at a time
+
+```
+# Possession date + confidence
+python possession_scraper.py "C:\path\book.xlsx" --sheet-name "inactive blank" --exclude-domains nobroker.in
+
+# RERA check: registered completion date, original -> revised, extension, compared with your possession_date
+python possession_scraper.py "C:\path\book.xlsx" --sheet-name "inactive >2yrs" --mode rera --exclude-domains nobroker.in
+```
+
+- Each tab gets its own `Results - <tab>` and `Summary - <tab>` tabs, and its own progress file, so the two runs never mix.
+- The city is taken from the address when there's no city column. Coordinates like `77.38° E` are fine.
+  Several RERA IDs in one cell (`ID1 | ID2`) are each searched.
+- RERA mode columns: **RERA Original Completion**, **RERA Current Completion**, **Extension / Revision**
+  ("Yes - extended X -> Y" or "No - revised date same as original"), **RERA vs Sheet**, the evidence and source.
+  Pages that quote the project's RERA ID are preferred over name matches.
+
+### Search credits and resuming
+
+With `SERPER_API_KEY` set, only Serper is used. When the key runs out of credits (or is rejected), the run **stops,
+saves, beeps and prints `SEARCH CREDITS USED UP`**. Put a new key in `.env` and run the same command again: it continues
+where it stopped, and searches already made are reused without spending credits.
+Measured usage: about 1.3 credits per row in possession mode, about 3.7 in RERA mode (`--max-queries 3` lowers this).
+Add `--fallback-free` to switch to the free engines instead of stopping.
+
 ## Claude review (optional second pass)
 
 Claude reads the evidence the scraper collected for rows that aren't High confidence and decides the right date.
