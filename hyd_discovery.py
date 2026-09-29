@@ -26,7 +26,9 @@ import re
 import sqlite3
 import ssl
 import sys
+import threading
 import time
+from concurrent.futures import ThreadPoolExecutor
 from difflib import SequenceMatcher
 from pathlib import Path
 from urllib.parse import parse_qs
@@ -59,7 +61,9 @@ HYD_BOX = (16.9, 18.0, 77.9, 79.1)  # lat_min, lat_max, lon_min, lon_max
 
 class DB:
     def __init__(self, path: Path):
-        self.c = sqlite3.connect(path)
+        self.c = sqlite3.connect(path, timeout=60, check_same_thread=False)
+        self.lock = threading.RLock()
+        self.c.execute("PRAGMA journal_mode=WAL")
         self.c.executescript("""
             CREATE TABLE IF NOT EXISTS rera_list(key TEXT PRIMARY KEY, district TEXT, data TEXT);
             CREATE TABLE IF NOT EXISTS district_done(district TEXT PRIMARY KEY, total INTEGER);
@@ -72,9 +76,18 @@ class DB:
         """)
 
     def put(self, table: str, key: str, data, col="data"):
-        self.c.execute(f"INSERT OR REPLACE INTO {table}(" + ("key" if table.startswith("rera") else "cid") +
-                       f", {col}) VALUES(?,?)", (key, json.dumps(data, ensure_ascii=False) if col == "data" else data))
-        self.c.commit()
+        with self.lock:
+            self.c.execute(f"INSERT OR REPLACE INTO {table}(" + ("key" if table.startswith("rera") else "cid") +
+                           f", {col}) VALUES(?,?)",
+                           (key, json.dumps(data, ensure_ascii=False) if col == "data" else data))
+            self.c.commit()
+
+    def execute(self, sql: str, params=()):
+        with self.lock:
+            cur = self.c.execute(sql, params)
+            rows = cur.fetchall()
+            self.c.commit()
+            return rows
 
     def all(self, table: str) -> dict:
         kcol = "key" if table.startswith("rera") else "cid"
@@ -273,6 +286,8 @@ def cmd_rera_list(args, db: DB):
 def _field(text: str, label: str, nxt: str) -> str:
     m = re.search(rf"{label}\s+(.*?)\s+{nxt}", text)
     v = m.group(1).strip() if m else ""
+    if re.match(r"(Street|Locality|Pin Code|Mandal|Village|Land ?mark)\b", v):  # the field itself was blank
+        v = ""
     return "" if v.lower() in ("na", "n/a", "-") or len(v) > 80 else v
 
 
@@ -302,17 +317,64 @@ def parse_detail(html: str) -> dict:
     }
 
 
+def parse_application(txt: str) -> dict:
+    """Fields from the RERA application PDF. The builder's office address comes first; the project's own
+    address follows the land details (Boundaries / Mortgage Area), so it is read from there."""
+    txt = re.sub(r"\s+", " ", txt.replace("\xad", "-"))
+    date = r"(\d{2}/\d{2}/\d{4})"
+    g = lambda rx, src=txt: (re.search(rx, src) or [None, ""])[1]
+    after_land = txt[txt.find("Boundaries"):] if "Boundaries" in txt else ""
+    m = re.search(r"State\s+Telangana\s+District.{0,300}?Pin Code\s+\d{6}", after_land)
+    addr = m.group(0) if m else ""
+    return {
+        "project_type": _field(txt, "Project Type", r"(?:Are there|Project Status|Is the|Litigations)"),
+        "status": _field(txt, "Project Status", r"(?:Approved Date|Proposed Date)"),
+        "approved": g(rf"Approved Date\s+{date}"),
+        "proposed_completion": g(rf"Proposed Date of Completion\s+{date}"),
+        "revised_completion": g(rf"Revised Proposed Date of Completion\s+{date}"),
+        "district": _field(addr, "District", "Mandal"),
+        "mandal": _field(addr, "Mandal", "Village/City/Town"),
+        "village": _field(addr, "Village/City/Town", r"(?:Street|Locality|Pin Code)"),
+        "street": _field(addr, "Street", r"(?:Locality|Pin Code)"),
+        "locality": _field(addr, "Locality", "Pin Code"),
+        "pin": g(r"Pin Code\s+(\d{6})", addr),
+        "extension_reg": g(r"Registration No\s*:\s*(EXT\d+)"),
+    }
+
+
+def fetch_application(client: httpx.Client, qstr: str) -> dict:
+    """The application PDF is addressed by the certificate's ID, which (unlike the 'View' link) does not expire."""
+    from pypdf import PdfReader
+    t = client.post(f"{RERA_BASE}/SearchList/showFileApplicationPreviewIframe", json={"ID": qstr, "Preview": "1"}).text
+    m = re.search(r'src="([^"]+)"', t)
+    if not m:
+        raise ValueError("no application preview")
+    pdf = client.get(RERA_BASE + m.group(1)).content
+    if not pdf.startswith(b"%PDF"):
+        raise ValueError("application preview is not a PDF")
+    pages = PdfReader(io.BytesIO(pdf)).pages
+    d = parse_application(" ".join(pg.extract_text() or "" for pg in pages[:5]))
+    if not d["pin"] and len(pages) > 5:  # long applications: the project address sits further in
+        d = parse_application(" ".join(pg.extract_text() or "" for pg in pages[:10]))
+    if not d["project_type"]:
+        raise ValueError("could not read the project type")
+    return d
+
+
 def geocode(client: httpx.Client, db: DB, parts: list[str], pin: str, last: list) -> tuple[float, float, str] | None:
     """OpenStreetMap Nominatim (free, max 1 request/second). Locality first, then PIN code."""
     tries = []
-    loc = [p for p in parts if p]
-    if loc:
-        tries.append(("locality", {"q": ", ".join(loc + ["Telangana", "India"])}))
+    locality, district = (parts + ["", ""])[:2]
+    if locality:
+        if district:
+            tries.append(("locality", {"q": f"{locality}, {district}, Telangana, India"}))
+        tries.append(("locality", {"q": f"{locality}, Hyderabad, Telangana, India"}))
     if pin:
         tries.append(("PIN code", {"postalcode": pin, "country": "India"}))
     for label, params in tries:
         key = json.dumps(params, sort_keys=True)
-        hit = db.c.execute("SELECT lat, lon FROM geo WHERE q=?", (key,)).fetchone()
+        found = db.execute("SELECT lat, lon FROM geo WHERE q=?", (key,))
+        hit = found[0] if found else None
         if hit is None:
             wait = last[0] + 1.1 - time.monotonic()
             if wait > 0:
@@ -326,8 +388,7 @@ def geocode(client: httpx.Client, db: DB, parts: list[str], pin: str, last: list
             except (httpx.HTTPError, ValueError):
                 j = []
             hit = (float(j[0]["lat"]), float(j[0]["lon"])) if j else (None, None)
-            db.c.execute("INSERT OR REPLACE INTO geo VALUES(?,?,?)", (key, *hit))
-            db.c.commit()
+            db.execute("INSERT OR REPLACE INTO geo VALUES(?,?,?)", (key, *hit))
         if hit[0] is not None and HYD_BOX[0] <= hit[0] <= HYD_BOX[1] and HYD_BOX[2] <= hit[1] <= HYD_BOX[3]:
             return hit[0], hit[1], label
     return None
@@ -348,47 +409,92 @@ def cert_rera_no(client: httpx.Client, qstr: str) -> str:
 
 
 def cmd_rera_details(args, db: DB, fp: Footprint):
+    """Project pages in parallel; map lookups (1/sec, the free service's limit) run alongside; then certificates."""
+    import queue
     listed = db.all("rera_list")
     details = db.all("rera_detail")
-    certs = {k for (k,) in db.c.execute("SELECT key FROM rera_cert")}
-    log.info("%d projects listed, %d with details already", len(listed), len(details))
+    todo = [(k, r) for k, r in listed.items() if k not in details and r.get("cert_qstr")]
+    log.info("%d projects listed, %d already have details, %d to fetch with %d parallel workers",
+             len(listed), len(details), len(todo), args.workers)
     ctx = truststore.SSLContext(ssl.PROTOCOL_TLS_CLIENT)
-    geo_last = [0.0]
-    with httpx.Client(verify=ctx, headers={"User-Agent": "Mozilla/5.0"}, timeout=60, follow_redirects=True) as rc, \
-            httpx.Client(timeout=30) as gc:
-        rc.get(SEARCH_URL)
-        for n, (key, row) in enumerate(listed.items(), 1):
-            if key in details and (key in certs or not details[key].get("in_footprint")):
-                continue
-            d = details.get(key)
-            try:
-                if d is None:
-                    d = parse_detail(rc.get(row["detail_url"]).text) if row["detail_url"] else {}
-                    time.sleep(args.delay)
-                    ok_type = any(t in d.get("project_type", "").lower() for t in KEEP_TYPES)
-                    d["type_ok"] = ok_type
-                    if ok_type:
-                        if row.get("dir_lat"):
-                            d.update(lat=row["dir_lat"], lon=row["dir_lon"], coord_source="RERA map pin")
-                        else:
-                            g = geocode(gc, db, [d.get("locality"), d.get("street"), d.get("village"), d.get("mandal"),
-                                                 d.get("district")], d.get("pin", ""), geo_last)
-                            if g:
-                                d.update(lat=g[0], lon=g[1], coord_source=f"approx. from {g[2]}")
-                        chk = fp.check(row["name"], d.get("lat"), d.get("lon"))
-                        d["nearest_km"] = chk["nearest_km"]
-                        d["in_footprint"] = chk["nearest_km"] is not None and chk["nearest_km"] <= args.radius_km
-                    db.put("rera_detail", key, d)
-                if d.get("in_footprint") and key not in certs and row.get("cert_qstr"):
-                    rn = cert_rera_no(rc, row["cert_qstr"])
-                    db.c.execute("INSERT OR REPLACE INTO rera_cert VALUES(?,?)", (key, rn))
-                    db.c.commit()
-                    time.sleep(args.delay)
-            except (httpx.HTTPError, ValueError) as e:
-                log.warning("%s (%s): %s - will retry next run", row["name"], key, e)
-                continue
-            if n % 25 == 0:
-                log.info("details %d/%d", n, len(listed))
+    rc = httpx.Client(verify=ctx, headers={"User-Agent": "Mozilla/5.0"}, timeout=90, follow_redirects=True,
+                      limits=httpx.Limits(max_connections=args.workers + 2))
+    gc = httpx.Client(timeout=30)
+    rc.get(SEARCH_URL)
+    geo_q: queue.Queue = queue.Queue()
+    counts = {"fetched": 0, "geocoded": 0}
+    count_lock = threading.Lock()
+
+    def finish(key, row, d):
+        chk = fp.check(row["name"], d.get("lat"), d.get("lon"))
+        d["nearest_km"] = chk["nearest_km"]
+        d["in_footprint"] = chk["nearest_km"] is not None and chk["nearest_km"] <= args.radius_km
+        db.put("rera_detail", key, d)
+
+    def fetch(item):
+        key, row = item
+        if not row.get("cert_qstr"):
+            return
+        try:
+            d = fetch_application(rc, row["cert_qstr"])
+        except Exception as e:  # network error or unreadable PDF: nothing saved, retried on the next run
+            log.warning("%s: %s - will retry next run", row["name"], e)
+            return
+        d["type_ok"] = any(t in d.get("project_type", "").lower() for t in KEEP_TYPES)
+        if not d["type_ok"]:
+            db.put("rera_detail", key, d)
+        elif row.get("dir_lat"):
+            d.update(lat=row["dir_lat"], lon=row["dir_lon"], coord_source="RERA map pin")
+            finish(key, row, d)
+        else:
+            geo_q.put((key, row, d))
+        with count_lock:
+            counts["fetched"] += 1
+            if counts["fetched"] % 100 == 0:
+                log.info("pages %d/%d fetched | map lookups waiting: %d", counts["fetched"], len(todo), geo_q.qsize())
+
+    def geocoder():
+        last = [0.0]
+        while True:
+            item = geo_q.get()
+            if item is None:
+                return
+            key, row, d = item
+            g = geocode(gc, db, [d.get("locality") or d.get("village") or d.get("street") or "",
+                                 d.get("district") or ""], d.get("pin", ""), last)
+            if g:
+                d.update(lat=g[0], lon=g[1], coord_source=f"approx. from {g[2]}")
+            finish(key, row, d)
+            counts["geocoded"] += 1
+            if counts["geocoded"] % 100 == 0:
+                log.info("map lookups done: %d | still waiting: %d", counts["geocoded"], geo_q.qsize())
+
+    gt = threading.Thread(target=geocoder, daemon=True)
+    gt.start()
+    with ThreadPoolExecutor(args.workers) as pool:
+        list(pool.map(fetch, todo))
+    log.info("All pages fetched. Finishing %d map lookups (about 1 per second)...", geo_q.qsize())
+    geo_q.put(None)
+    gt.join()
+
+    certs = {k for (k,) in db.execute("SELECT key FROM rera_cert")}
+    need = [(k, listed[k]) for k, d in db.all("rera_detail").items()
+            if d.get("in_footprint") and k not in certs and listed.get(k, {}).get("cert_qstr")]
+    log.info("Reading RERA numbers from %d certificates...", len(need))
+
+    def cert(item):
+        k, row = item
+        try:
+            rn = cert_rera_no(rc, row["cert_qstr"])
+        except Exception as e:  # network errors and unreadable PDFs alike: retry on the next run
+            log.warning("certificate for %s: %s", row["name"], e)
+            return
+        db.execute("INSERT OR REPLACE INTO rera_cert VALUES(?,?)", (k, rn))
+
+    with ThreadPoolExecutor(args.workers) as pool:
+        list(pool.map(cert, need))
+    rc.close()
+    gc.close()
     log.info("Details done. Next: python hyd_discovery.py places   (or build)")
 
 
@@ -695,7 +801,7 @@ def main():
     p.add_argument("--radius-km", type=float, default=3.0, help="Keep projects within this distance of a NoBroker project")
     p.add_argument("--terms", nargs="+", default=PLACE_TERMS, help="Google Maps search terms per locality")
     p.add_argument("--pages", type=int, default=2, help="Maps result pages per search (10 places each)")
-    p.add_argument("--delay", type=float, default=0.5, help="Seconds between RERA portal requests")
+    p.add_argument("--workers", type=int, default=6, help="rera-details: project pages fetched in parallel")
     p.add_argument("--only", choices=["a", "b", "both"], default="both", help="enrich: which set to look up")
     args = p.parse_args()
 
