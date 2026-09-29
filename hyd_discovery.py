@@ -327,7 +327,8 @@ def parse_application(txt: str) -> dict:
     m = re.search(r"State\s+Telangana\s+District.{0,300}?Pin Code\s+\d{6}", after_land)
     addr = m.group(0) if m else ""
     return {
-        "project_type": _field(txt, "Project Type", r"(?:Are there|Project Status|Is the|Litigations)"),
+        "project_type": g(r"Project Type\s+(Residential|Commercial|Plotted Development|Mixed Development"
+                          r"(?:\s*\(Residential\s*&(?:amp;)?\s*Commercial\))?|Mixed)"),
         "status": _field(txt, "Project Status", r"(?:Approved Date|Proposed Date)"),
         "approved": g(rf"Approved Date\s+{date}"),
         "proposed_completion": g(rf"Proposed Date of Completion\s+{date}"),
