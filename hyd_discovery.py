@@ -505,18 +505,34 @@ class CreditsOut(Exception):
     pass
 
 
+class SerperFailed(Exception):
+    """Serper could not answer this one request (server error / timeout) after retries."""
+
+
 def serper(client: httpx.Client, endpoint: str, payload: dict) -> dict:
-    for attempt in range(5):
-        r = client.post(f"https://google.serper.dev/{endpoint}", json=payload,
-                        headers={"X-API-KEY": os.environ["SERPER_API_KEY"], "Content-Type": "application/json"})
+    last = ""
+    for attempt in range(4):
+        try:
+            r = client.post(f"https://google.serper.dev/{endpoint}", json=payload,
+                            headers={"X-API-KEY": os.environ["SERPER_API_KEY"], "Content-Type": "application/json"})
+        except httpx.HTTPError as e:
+            last = str(e)
+            time.sleep(3 * (attempt + 1))
+            continue
         if r.status_code == 429:
             time.sleep(10 * (attempt + 1))
+            last = "rate limited"
             continue
         if r.status_code in (401, 402, 403) or (r.status_code == 400 and "credit" in r.text.lower()):
             raise CreditsOut(f"HTTP {r.status_code}: {r.text[:150]}")
-        r.raise_for_status()
+        if r.status_code >= 500:
+            last = f"HTTP {r.status_code}"
+            time.sleep(3 * (attempt + 1))
+            continue
+        if r.status_code >= 400:
+            raise SerperFailed(f"HTTP {r.status_code}: {r.text[:150]}")
         return r.json()
-    raise CreditsOut("rate limited repeatedly")
+    raise SerperFailed(last)
 
 
 def stop_for_credits(e: Exception):
@@ -550,10 +566,22 @@ def cmd_places(args, db: DB, nb: pd.DataFrame):
              len(locs), len(args.terms), len(queries), len(queries) - len(todo), len(todo), int(len(todo) * 1.4))
     with httpx.Client(timeout=30) as c:
         try:
+            fails_in_a_row = 0
             for n, q in enumerate(todo, 1):
                 got = 0
                 for page in range(1, args.pages + 1):
-                    j = serper(c, "places", {"q": q, "gl": "in", "hl": "en", "page": page})
+                    try:
+                        j = serper(c, "places", {"q": q, "gl": "in", "hl": "en", "page": page})
+                        fails_in_a_row = 0
+                    except SerperFailed as e:
+                        fails_in_a_row += 1
+                        log.warning("Serper couldn't answer %r page %d (%s) - skipped", q, page, e)
+                        if fails_in_a_row >= 15:
+                            log.error("Serper failed 15 times in a row - it seems to be having problems. "
+                                      "Progress saved; re-run this command later.")
+                            notify_user()
+                            return
+                        break
                     items = j.get("places", [])
                     for p in items:
                         if p.get("cid"):
@@ -717,7 +745,11 @@ def cmd_enrich(args, db: DB, fp: Footprint):
     with httpx.Client(timeout=30) as c:
         try:
             for n, (key, name, area) in enumerate(todo, 1):
-                db.put("enrich", key, web_lookup(c, name, area))
+                try:
+                    db.put("enrich", key, web_lookup(c, name, area))
+                except SerperFailed as e:
+                    log.warning("lookup failed for %s (%s) - will retry next run", name, e)
+                    continue
                 if n % 25 == 0:
                     log.info("enriched %d/%d", n, len(todo))
         except CreditsOut as e:
@@ -822,8 +854,14 @@ def main():
         return cmd_rera_list(args, db)
     nb = load_nobroker(args.nobroker, args.nobroker_sheet)
     fp = Footprint(nb)
-    {"rera-details": lambda: cmd_rera_details(args, db, fp), "places": lambda: cmd_places(args, db, nb),
-     "enrich": lambda: cmd_enrich(args, db, fp), "build": lambda: cmd_build(args, db, fp)}[args.step]()
+    try:
+        {"rera-details": lambda: cmd_rera_details(args, db, fp), "places": lambda: cmd_places(args, db, nb),
+         "enrich": lambda: cmd_enrich(args, db, fp), "build": lambda: cmd_build(args, db, fp)}[args.step]()
+    except KeyboardInterrupt:
+        log.warning("Stopped by you - progress is saved; run the same command to continue.")
+    except Exception:
+        log.exception("%s crashed - progress is saved; send this log to get it fixed", args.step)
+        raise
 
 
 if __name__ == "__main__":
