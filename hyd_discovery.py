@@ -511,7 +511,7 @@ class SerperFailed(Exception):
 
 def serper(client: httpx.Client, endpoint: str, payload: dict) -> dict:
     last = ""
-    for attempt in range(4):
+    for attempt in range(2):
         try:
             r = client.post(f"https://google.serper.dev/{endpoint}", json=payload,
                             headers={"X-API-KEY": os.environ["SERPER_API_KEY"], "Content-Type": "application/json"})
@@ -556,49 +556,73 @@ def localities(nb: pd.DataFrame, db: DB) -> list[str]:
 
 
 def cmd_places(args, db: DB, nb: pd.DataFrame):
+    """Serper Maps search per locality and term. Serper's page 2 for Maps is unreliable (slow, then HTTP 500),
+    so only first pages (10 places) are fetched unless --pages says otherwise."""
     if not os.getenv("SERPER_API_KEY"):
         sys.exit("SERPER_API_KEY missing in .env")
     locs = localities(nb, db)
-    done = {q for (q,) in db.c.execute("SELECT q FROM place_query")}
+    done = {q for (q,) in db.execute("SELECT q FROM place_query")}
     queries = [f"{t} in {l} Hyderabad" for l in locs for t in args.terms]
     todo = [q for q in queries if q not in done]
-    log.info("%d localities x %d terms = %d searches (%d done, %d to go, ~%d credits incl. 2nd pages)",
-             len(locs), len(args.terms), len(queries), len(queries) - len(todo), len(todo), int(len(todo) * 1.4))
-    with httpx.Client(timeout=30) as c:
-        try:
-            fails_in_a_row = 0
-            for n, q in enumerate(todo, 1):
-                got = 0
-                for page in range(1, args.pages + 1):
-                    try:
-                        j = serper(c, "places", {"q": q, "gl": "in", "hl": "en", "page": page})
-                        fails_in_a_row = 0
-                    except SerperFailed as e:
-                        fails_in_a_row += 1
-                        log.warning("Serper couldn't answer %r page %d (%s) - skipped", q, page, e)
-                        if fails_in_a_row >= 15:
-                            log.error("Serper failed 15 times in a row - it seems to be having problems. "
-                                      "Progress saved; re-run this command later.")
-                            notify_user()
-                            return
-                        break
-                    items = j.get("places", [])
-                    for p in items:
-                        if p.get("cid"):
-                            db.put("places", str(p["cid"]), {**p, "query": q})
-                    got += len(items)
-                    if len(items) < 10:
-                        break
-                db.c.execute("INSERT OR REPLACE INTO place_query VALUES(?,?)", (q, got))
-                db.c.commit()
-                if n % 20 == 0:
-                    total = db.c.execute("SELECT COUNT(*) FROM places").fetchone()[0]
-                    log.info("places searches %d/%d | %d unique places so far", n, len(todo), total)
-        except CreditsOut as e:
-            stop_for_credits(e)
+    log.info("%d localities x %d terms = %d searches (%d done, %d to go, ~%d credits), %d at a time",
+             len(locs), len(args.terms), len(queries), len(queries) - len(todo), len(todo),
+             len(todo) * args.pages, args.search_workers)
+    stop = threading.Event()
+    state = {"n": 0, "fails": 0, "credits_error": None}
+    lock = threading.Lock()
+    client = httpx.Client(timeout=40, limits=httpx.Limits(max_connections=args.search_workers + 2))
+
+    def one(q: str):
+        if stop.is_set():
             return
+        got = 0
+        for page in range(1, args.pages + 1):
+            try:
+                j = serper(client, "places", {"q": q, "gl": "in", "hl": "en", "page": page})
+            except CreditsOut as e:
+                state["credits_error"] = e
+                stop.set()
+                return
+            except SerperFailed as e:
+                with lock:
+                    state["fails"] += 1
+                    too_many = state["fails"] >= 25
+                log.warning("Serper couldn't answer %r page %d (%s) - skipped", q, page, e)
+                if too_many:
+                    stop.set()
+                if page == 1:
+                    return  # not marked done, so the next run tries it again
+                break
+            items = j.get("places", [])
+            with db.lock:
+                db.c.executemany("INSERT OR REPLACE INTO places(cid, data) VALUES(?,?)",
+                                 [(str(p["cid"]), json.dumps({**p, "query": q}, ensure_ascii=False))
+                                  for p in items if p.get("cid")])
+                db.c.commit()
+            got += len(items)
+            if len(items) < 10:
+                break
+        db.execute("INSERT OR REPLACE INTO place_query VALUES(?,?)", (q, got))
+        with lock:
+            state["n"] += 1
+            if state["n"] % 50 == 0:
+                total = db.execute("SELECT COUNT(*) FROM places")[0][0]
+                log.info("places searches %d/%d | %d unique places so far", state["n"], len(todo), total)
+
+    try:
+        with ThreadPoolExecutor(args.search_workers) as pool:
+            list(pool.map(one, todo))
+    finally:
+        client.close()
+    if state["credits_error"]:
+        stop_for_credits(state["credits_error"])
+        return
+    if stop.is_set():
+        log.error("Serper failed 25 times - it seems to be having problems. Progress saved; re-run later.")
+        notify_user()
+        return
     log.info("Places done: %d unique places. Next: python hyd_discovery.py enrich (optional) or build",
-             db.c.execute("SELECT COUNT(*) FROM places").fetchone()[0])
+             db.execute("SELECT COUNT(*) FROM places")[0][0])
 
 
 def set_a_rows(db: DB, fp: Footprint, radius: float) -> list[dict]:
@@ -833,7 +857,8 @@ def main():
     p.add_argument("--out", default=r"C:\Users\shres\Downloads\Hyderabad projects not on NoBroker.xlsx")
     p.add_argument("--radius-km", type=float, default=3.0, help="Keep projects within this distance of a NoBroker project")
     p.add_argument("--terms", nargs="+", default=PLACE_TERMS, help="Google Maps search terms per locality")
-    p.add_argument("--pages", type=int, default=2, help="Maps result pages per search (10 places each)")
+    p.add_argument("--pages", type=int, default=1, help="Maps result pages per search (10 places each)")
+    p.add_argument("--search-workers", type=int, default=4, help="places/enrich: Serper searches in parallel")
     p.add_argument("--workers", type=int, default=6, help="rera-details: project pages fetched in parallel")
     p.add_argument("--only", choices=["a", "b", "both"], default="both", help="enrich: which set to look up")
     args = p.parse_args()
