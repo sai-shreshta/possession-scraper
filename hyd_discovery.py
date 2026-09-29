@@ -402,7 +402,7 @@ def geocode(client: httpx.Client, db: DB, parts: list[str], pin: str, last: list
     return None
 
 
-def cert_rera_no(client: httpx.Client, qstr: str) -> str:
+def cert_text(client: httpx.Client, qstr: str) -> str:
     from pypdf import PdfReader
     r = client.post(f"{RERA_BASE}/SearchList/ShowCertificateIframe", json={"ID": qstr})
     m = re.search(r'src="([^"]+GetShowCertificateFileContent[^"]+)"', r.text)
@@ -412,8 +412,26 @@ def cert_rera_no(client: httpx.Client, qstr: str) -> str:
     if not pdf.startswith(b"%PDF"):
         return ""
     txt = " ".join(p.extract_text() or "" for p in PdfReader(io.BytesIO(pdf)).pages[:2])
-    ids = RERA_ID_RE.findall(txt.replace(" ", ""))
+    return re.sub(r"\s+", " ", txt.replace("\xad", "-"))
+
+
+def cert_rera_no(client: httpx.Client, qstr: str) -> str:
+    ids = RERA_ID_RE.findall(cert_text(client, qstr).replace(" ", ""))
     return ids[0] if ids else ""
+
+
+def parse_certificate(txt: str) -> dict:
+    """Form C: '... registration number : P02200003775 Project: X , Survey No.: .., at Kukatpally, Kukatpally,
+    Medchal-Malkajgiri, 500090; ...' - used when the application PDF is a scanned image."""
+    rera = RERA_ID_RE.findall(txt.replace(" ", ""))
+    m = re.search(r"Project:\s*.+?\bat\s+(.+?),\s*(\d{6})\s*;", txt)
+    parts = [x.strip() for x in m.group(1).split(",")] if m else []
+    valid = re.search(r"ending with\s+(\d{2}/\d{2}/\d{4})", txt)
+    return {"project_type": "Unknown (scanned application)", "status": "", "approved": "",
+            "proposed_completion": valid.group(1) if valid else "", "revised_completion": "",
+            "district": parts[-1] if len(parts) >= 2 else "", "mandal": parts[-2] if len(parts) >= 3 else "",
+            "village": "", "street": "", "locality": parts[0] if parts else "", "pin": m.group(2) if m else "",
+            "extension_reg": "", "rera_from_cert": rera[0] if rera else ""}
 
 
 def cmd_rera_details(args, db: DB, fp: Footprint):
@@ -445,10 +463,22 @@ def cmd_rera_details(args, db: DB, fp: Footprint):
             return
         try:
             d = fetch_application(rc, row["cert_qstr"])
-        except Exception as e:  # network error or unreadable PDF: nothing saved, retried on the next run
+        except ValueError as e:
+            # Scanned (image-only) application: the certificate still gives RERA number and location.
+            try:
+                d = parse_certificate(cert_text(rc, row["cert_qstr"]))
+            except Exception as e2:
+                log.warning("%s: %s / certificate: %s - will retry next run", row["name"], e, e2)
+                return
+            if not d["pin"] and not d["locality"]:
+                log.warning("%s: %s and no location on certificate - will retry next run", row["name"], e)
+                return
+            if d["rera_from_cert"]:
+                db.execute("INSERT OR REPLACE INTO rera_cert VALUES(?,?)", (key, d["rera_from_cert"]))
+        except Exception as e:  # network error: nothing saved, retried on the next run
             log.warning("%s: %s - will retry next run", row["name"], e)
             return
-        d["type_ok"] = any(t in d.get("project_type", "").lower() for t in KEEP_TYPES)
+        d["type_ok"] = d["project_type"].startswith("Unknown") or             any(t in d.get("project_type", "").lower() for t in KEEP_TYPES)
         if not d["type_ok"]:
             db.put("rera_detail", key, d)
         elif row.get("dir_lat"):
