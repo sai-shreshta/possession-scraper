@@ -415,23 +415,28 @@ def cert_text(client: httpx.Client, qstr: str) -> str:
     return re.sub(r"\s+", " ", txt.replace("\xad", "-"))
 
 
-def cert_rera_no(client: httpx.Client, qstr: str) -> str:
-    ids = RERA_ID_RE.findall(cert_text(client, qstr).replace(" ", ""))
+def find_rera_no(txt: str) -> str:
+    """P0 + 10 digits. PDF text sometimes splits the number with spaces, so fall back to a space-free search
+    (where the number runs straight into the next word, hence no word boundary after it)."""
+    ids = RERA_ID_RE.findall(txt) or re.findall(r"P0\d{10}(?!\d)", txt.replace(" ", ""))
     return ids[0] if ids else ""
+
+
+def cert_rera_no(client: httpx.Client, qstr: str) -> str:
+    return find_rera_no(cert_text(client, qstr))
 
 
 def parse_certificate(txt: str) -> dict:
     """Form C: '... registration number : P02200003775 Project: X , Survey No.: .., at Kukatpally, Kukatpally,
     Medchal-Malkajgiri, 500090; ...' - used when the application PDF is a scanned image."""
-    rera = RERA_ID_RE.findall(txt.replace(" ", ""))
     m = re.search(r"Project:\s*.+?\bat\s+(.+?),\s*(\d{6})\s*;", txt)
     parts = [x.strip() for x in m.group(1).split(",")] if m else []
     valid = re.search(r"ending with\s+(\d{2}/\d{2}/\d{4})", txt)
     return {"project_type": "Unknown (scanned application)", "status": "", "approved": "",
             "proposed_completion": valid.group(1) if valid else "", "revised_completion": "",
-            "district": parts[-1] if len(parts) >= 2 else "", "mandal": parts[-2] if len(parts) >= 3 else "",
+            "district": re.sub(r"-\s+", "-", parts[-1]) if len(parts) >= 2 else "", "mandal": parts[-2] if len(parts) >= 3 else "",
             "village": "", "street": "", "locality": parts[0] if parts else "", "pin": m.group(2) if m else "",
-            "extension_reg": "", "rera_from_cert": rera[0] if rera else ""}
+            "extension_reg": "", "rera_from_cert": find_rera_no(txt)}
 
 
 def cmd_rera_details(args, db: DB, fp: Footprint):
