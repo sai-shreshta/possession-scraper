@@ -73,6 +73,8 @@ class DB:
             CREATE TABLE IF NOT EXISTS place_query(q TEXT PRIMARY KEY, n INTEGER);
             CREATE TABLE IF NOT EXISTS places(cid TEXT PRIMARY KEY, data TEXT);
             CREATE TABLE IF NOT EXISTS enrich(cid TEXT PRIMARY KEY, data TEXT);
+            CREATE TABLE IF NOT EXISTS listing_query(q TEXT PRIMARY KEY, n INTEGER);
+            CREATE TABLE IF NOT EXISTS listings(cid TEXT PRIMARY KEY, data TEXT);
         """)
 
     def put(self, table: str, key: str, data, col="data"):
@@ -148,6 +150,7 @@ class Footprint:
         self.nb = nb
         self.lats, self.lons = nb["lat"].to_numpy(float), nb["lon"].to_numpy(float)
         self.rera = set(nb["rera_norm"]) - {""}
+        self.index = NameIndex([{"name": n} for n in nb["building_name"]])
 
     def check(self, name: str, lat: float | None, lon: float | None, rera_no: str = "",
               match_km: float = 2.0) -> dict:
@@ -157,6 +160,10 @@ class Footprint:
             hit = self.nb[self.nb["rera_norm"] == rera_no].iloc[0]
             out.update(onboarded="Yes (same RERA number)", onboarded_as=hit["building_name"])
         if lat is None or lon is None:
+            if not out["onboarded"]:  # no location to compare: accept only a near-identical name
+                hit = self.index.best(name, None, None, km=0, min_sim=0.9)
+                if hit:
+                    out.update(onboarded="Yes (same name, location unknown)", onboarded_as=hit["name"])
             return out
         dist = km_to_all(lat, lon, self.lats, self.lons)
         i = int(dist.argmin())
@@ -743,7 +750,8 @@ def web_lookup(c: httpx.Client, name: str, area: str) -> dict:
         cands += ex.from_snippet(title, snip, url, m)[0]
         rera = rera or next(iter(RERA_ID_RE.findall(f"{title} {snip}")), "")
         b = re.search(r"\bby\s+([A-Z][\w&.'\- ]{2,40}?)(?=\s*(?:[|\-,:(]|in\b|at\b|$))", title)
-        builder = builder or (b.group(1).strip() if b else "")
+        if b and not _MONTH_START.match(b.group(1)):
+            builder = builder or b.group(1).strip()
     v = ex.aggregate(cands, ex.Counter())
     price, per_sqft = extract_price(texts)
     return {"builder": builder, "rera_no": rera, "possession": v.display if v.found else "",
@@ -758,8 +766,9 @@ def cmd_enrich(args, db: DB, fp: Footprint):
     a_rows = set_a_rows(db, fp, args.radius_km)
     todo = []
     if args.only in ("a", "both"):
+        set_c_rows(db, fp, a_rows, args.radius_km)  # fills listing_price on RERA projects found on listing sites
         todo += [("a:" + r["key"], r["name"], r.get("locality") or r.get("village") or r.get("mandal") or "")
-                 for r in a_rows if not r["onboarded"]]
+                 for r in a_rows if not r["onboarded"] and not r.get("listing_price")]
     if args.only in ("b", "both"):
         todo += [(r["cid"], r["name"], r["address"] or r["found_via"].split(" in ", 1)[-1].replace(" Hyderabad", ""))
                  for r in set_b_rows(db, fp, a_rows, args.radius_km)
@@ -782,50 +791,294 @@ def cmd_enrich(args, db: DB, fp: Footprint):
     log.info("Enrichment done. Next: python hyd_discovery.py build")
 
 
+# ----------------------------------------------------------------------------- Set C: listing sites via Google
+
+LISTING_SITES = {
+    "99acres": ("99acres.com", re.compile(r"99acres\.com/(?P<slug>[^/?#]+?)-npxid-r\d+")),
+    "magicbricks": ("magicbricks.com", re.compile(r"magicbricks\.com/(?P<slug>[^/?#]+?)-pdpid-")),
+    "housing": ("housing.com", re.compile(r"housing\.com/in/buy/projects/page/\d+-(?P<slug>[^/?#]+)")),
+    "squareyards": ("squareyards.com",
+                    re.compile(r"squareyards\.com/hyderabad-(?:residential|commercial)-property/(?P<slug>[^/]+)/\d+/project")),
+}
+_TITLE_NOISE = re.compile(r"\b(FAQs?|Price List|Prices?|Reviews?|Floor Plans?|Brochure|Resale|Photos|Overview|Rera)\b.*$",
+                          re.I)
+
+
+_MONTH_START = re.compile(r"(jan|feb|mar|apr|may|jun|jul|aug|sep|oct|nov|dec)[a-z]*\.?(\s|$)|\d", re.I)
+
+
+def _nice(t: str) -> str:
+    t = re.sub(r"\s+", " ", t).strip(" -|:,")
+    return t.title() if t.isupper() or t.islower() else t
+
+
+def parse_listing(site: str, o: dict, known_locs: dict) -> dict | None:
+    """One Google result -> project record, or None when it isn't an individual project page."""
+    url, title, snip = o.get("link", ""), o.get("title", ""), o.get("snippet", "")
+    m = LISTING_SITES[site][1].search(url)
+    if not m:
+        return None
+    slug = m.group("slug")
+    name = loc = builder = ""
+    if site == "housing":
+        parts = slug.split("-by-", 1)
+        name = parts[0].replace("-", " ")
+        if len(parts) > 1:
+            builder = re.sub(r"-in-[a-z0-9-]+$", "", parts[1]).replace("-", " ")
+        mt = re.search(r"\bin\s+([^,|-]+),\s*Hyderabad", title)
+        loc = mt.group(1) if mt else ""
+    elif site == "squareyards":
+        bits = [b.strip() for b in title.split(" - ")[0].split(",")]
+        name = bits[0]
+        loc = bits[1] if len(bits) >= 3 else ""
+    elif site == "magicbricks":
+        mt = re.match(r"(.+?)\s+in\s+([^,|]+),\s*Hyderabad", title)
+        name, loc = (mt.group(1), mt.group(2)) if mt else (title.split(",")[0], "")
+    else:  # 99acres: "Prestige Beverly Hills Kokapet, Hyderabad" - locality is glued on the end
+        head = _TITLE_NOISE.sub("", title.split(",")[0]).strip(" -")
+        words = head.split()
+        for k in (3, 2, 1):
+            tail = ex.norm(" ".join(words[-k:])) if len(words) > k else ""
+            if tail and tail in known_locs:
+                name, loc = " ".join(words[:-k]), known_locs[tail]
+                break
+        else:
+            name = head
+    name = _TITLE_NOISE.sub("", name).strip()
+    if len(ex.norm(name)) < 3:
+        return None
+    text = f"{title} . {snip}"
+    b = re.search(r"\bby\s+([A-Z][\w&.'\- ]{2,40}?)(?=\s*(?:[|\-,:(]|in\b|at\b|$))", text)
+    if b and not _MONTH_START.match(b.group(1)):
+        builder = builder or b.group(1)
+    matcher = ex.NameMatcher(name, loc, "Hyderabad")
+    v = ex.aggregate(ex.from_snippet(title, snip, url, matcher)[0], ex.Counter())
+    price, per_sqft = extract_price([text])
+    return {"site": site, "name": _nice(name), "locality": _nice(loc), "builder": _nice(builder),
+            "rera_no": next(iter(RERA_ID_RE.findall(text)), ""), "price": price, "price_sqft": per_sqft,
+            "possession": v.display if v.found else "", "url": url}
+
+
+def cmd_listings(args, db: DB, nb: pd.DataFrame):
+    """Google search restricted to each listing site, per locality; keeps only individual project pages."""
+    if not os.getenv("SERPER_API_KEY"):
+        sys.exit("SERPER_API_KEY missing in .env")
+    locs = localities(nb, db)
+    known = {ex.norm(l): l for l in locs}
+    done = {q for (q,) in db.execute("SELECT q FROM listing_query")}
+    queries = [(site, l, f"site:{LISTING_SITES[site][0]} {l} Hyderabad project price possession")
+               for l in locs for site in args.sites]
+    todo = [t for t in queries if t[2] not in done]
+    log.info("%d localities x %d sites = %d searches (%d done, %d to go, ~%d credits), %d at a time",
+             len(locs), len(args.sites), len(queries), len(queries) - len(todo), len(todo), len(todo),
+             args.search_workers)
+    stop = threading.Event()
+    state = {"n": 0, "fails": 0, "credits_error": None}
+    lock = threading.Lock()
+    client = httpx.Client(timeout=40, limits=httpx.Limits(max_connections=args.search_workers + 2))
+
+    def one(item):
+        site, loc, q = item
+        if stop.is_set():
+            return
+        try:
+            j = serper(client, "search", {"q": q, "gl": "in", "hl": "en", "num": 10})
+        except CreditsOut as e:
+            state["credits_error"] = e
+            stop.set()
+            return
+        except SerperFailed as e:
+            with lock:
+                state["fails"] += 1
+                if state["fails"] >= 25:
+                    stop.set()
+            log.warning("search failed %r (%s) - will retry next run", q, e)
+            return
+        recs = [r for r in (parse_listing(site, o, known) for o in j.get("organic", [])) if r]
+        for r in recs:
+            r["locality"] = r["locality"] or loc
+            r["query_locality"] = loc
+        with db.lock:
+            db.c.executemany("INSERT OR REPLACE INTO listings(cid, data) VALUES(?,?)",
+                             [(r["url"], json.dumps(r, ensure_ascii=False)) for r in recs])
+            db.c.execute("INSERT OR REPLACE INTO listing_query VALUES(?,?)", (q, len(recs)))
+            db.c.commit()
+        with lock:
+            state["n"] += 1
+            if state["n"] % 50 == 0:
+                log.info("listing searches %d/%d | %d project pages so far", state["n"], len(todo),
+                         db.execute("SELECT COUNT(*) FROM listings")[0][0])
+
+    try:
+        with ThreadPoolExecutor(args.search_workers) as pool:
+            list(pool.map(one, todo))
+    finally:
+        client.close()
+    if state["credits_error"]:
+        stop_for_credits(state["credits_error"])
+        return
+    if stop.is_set():
+        log.error("Serper failed 25 times - it seems to be having problems. Progress saved; re-run later.")
+        notify_user()
+        return
+    # Approximate area coordinates for each listing locality (only used for the 3 km NoBroker check).
+    need = sorted({d["locality"] for d in db.all("listings").values() if d.get("locality")})
+    log.info("Locating %d listing localities (free map lookup, ~1 per second, cached)...", len(need))
+    last = [0.0]
+    with httpx.Client(timeout=30) as gc:
+        for l in need:
+            geocode(gc, db, [l, ""], "", last)
+    log.info("Listings done: %d project pages. Next: python hyd_discovery.py build",
+             db.execute("SELECT COUNT(*) FROM listings")[0][0])
+
+
+def locality_coords(db: DB, loc: str) -> tuple[float, float] | tuple[None, None]:
+    """Cached result of geocode(locality) - no network here."""
+    key = json.dumps({"q": f"{loc}, Hyderabad, Telangana, India"}, sort_keys=True)
+    hit = db.execute("SELECT lat, lon FROM geo WHERE q=?", (key,))
+    if hit and hit[0][0] is not None and HYD_BOX[0] <= hit[0][0] <= HYD_BOX[1] and HYD_BOX[2] <= hit[0][1] <= HYD_BOX[3]:
+        return hit[0]
+    return None, None
+
+
+class NameIndex:
+    """Find same-named projects quickly: candidates share at least one distinctive name word."""
+
+    def __init__(self, rows: list[dict]):
+        self.rows, self.by_tok = rows, {}
+        for i, r in enumerate(rows):
+            for t in set(name_tokens(r["name"])):
+                self.by_tok.setdefault(t, []).append(i)
+
+    def best(self, name: str, lat, lon, km: float, min_sim: float = 0.8) -> dict | None:
+        cands = {i for t in set(name_tokens(name)) for i in self.by_tok.get(t, [])}
+        best, best_s = None, 0.0
+        for i in cands:
+            r = self.rows[i]
+            if lat is not None and r.get("lat") is not None and math.dist((lat, lon), (r["lat"], r["lon"])) * 111 > km:
+                continue
+            sim = name_sim(name, r["name"])
+            if sim > best_s:
+                best, best_s = r, sim
+        return best if best_s >= min_sim else None
+
+
+def set_c_rows(db: DB, fp: Footprint, a_rows: list[dict], radius: float) -> list[dict]:
+    """Listing-site projects merged across sites, checked against NoBroker and matched to RERA (Set A)."""
+    merged: dict[str, dict] = {}
+    for d in db.all("listings").values():
+        key = ex.norm(d["name"]) + "|" + ex.norm(d.get("locality", ""))
+        m = merged.setdefault(key, {"name": d["name"], "locality": d.get("locality", ""), "sites": set(), "urls": []})
+        m["sites"].add(d["site"])
+        m["urls"].append(d["url"])
+        for f in ("builder", "rera_no", "price", "price_sqft", "possession"):
+            if d.get(f) and not m.get(f):
+                m[f] = d[f]
+    a_index = NameIndex(a_rows)
+    rows = []
+    for m in merged.values():
+        lat, lon = locality_coords(db, m["locality"]) if m["locality"] else (None, None)
+        chk = fp.check(m["name"], lat, lon, m.get("rera_no", ""), match_km=3.0)
+        if chk["nearest_km"] is not None and chk["nearest_km"] > radius + 2:  # locality centre, so allow slack
+            continue
+        a = a_index.best(m["name"], lat, lon, km=3.0)
+        row = {**m, "lat": lat, "lon": lon, **chk, "sites": ", ".join(sorted(m["sites"])), "url": m["urls"][0],
+               "in_set_a": "Yes" if a else "No"}
+        if a:
+            row.update(rera_no=row.get("rera_no") or a["rera_no"], builder=row.get("builder") or a["builder"],
+                       rera_possession=a.get("revised_completion") or a.get("proposed_completion", ""),
+                       a_key=a["key"])
+            if a.get("onboarded") and not row["onboarded"]:
+                row.update(onboarded=a["onboarded"], onboarded_as=a["onboarded_as"])
+            a.setdefault("listing_price", row.get("price", ""))
+            a.setdefault("listing_price_sqft", row.get("price_sqft", ""))
+            a.setdefault("listing_possession", row.get("possession", ""))
+            a.setdefault("listing_url", row["url"])
+        rows.append(row)
+    return rows
+
+
 # ----------------------------------------------------------------------------- output
 
 def cmd_build(args, db: DB, fp: Footprint):
     a_rows = set_a_rows(db, fp, args.radius_km)
+    c_rows = set_c_rows(db, fp, a_rows, args.radius_km)  # also copies listing price/possession onto RERA projects
     b_rows = set_b_rows(db, fp, a_rows, args.radius_km)
+
+    # One list of every new project: RERA projects, plus listing-site projects that aren't in RERA.
+    combined = []
     for a in a_rows:
-        a["in_set_b"] = "Yes" if any(name_sim(a["name"], r["name"]) >= 0.8 and r.get("lat") and a.get("lat") and
-                                     math.dist((a["lat"], a["lon"]), (r["lat"], r["lon"])) * 111 <= 1.5
-                                     for r in b_rows) else "No"
+        if a["onboarded"]:
+            continue
+        combined.append({
+            "Project Name": a["name"], "Builder": a["builder"], "City": "Hyderabad",
+            "Location": ", ".join(x for x in (a.get("locality"), a.get("village"), a.get("mandal")) if x),
+            "District": a.get("district", ""), "PIN": a.get("pin", ""), "RERA ID": a["rera_no"],
+            "Project Type": a.get("project_type", ""),
+            "Price": a.get("listing_price") or a.get("price", ""),
+            "Price per sq.ft": a.get("listing_price_sqft") or a.get("price_sqft", ""),
+            "Possession (RERA)": a.get("revised_completion") or a.get("proposed_completion", ""),
+            "Possession (listing sites)": a.get("listing_possession") or a.get("market_possession", ""),
+            "Found In": "RERA register" + (" + listing sites" if a.get("listing_url") else ""),
+            "Link": a.get("listing_url") or a.get("detail_url", ""),
+            "Nearest NoBroker Project": a.get("nearest_nb", ""), "Distance (km)": a.get("nearest_km", "")})
+    for c in c_rows:
+        if c["onboarded"] or c["in_set_a"] == "Yes":
+            continue
+        combined.append({
+            "Project Name": c["name"], "Builder": c.get("builder", ""), "City": "Hyderabad",
+            "Location": c.get("locality", ""), "District": "", "PIN": "", "RERA ID": c.get("rera_no", ""),
+            "Project Type": "", "Price": c.get("price", ""), "Price per sq.ft": c.get("price_sqft", ""),
+            "Possession (RERA)": "", "Possession (listing sites)": c.get("possession", ""),
+            "Found In": f"listing sites ({c['sites']})", "Link": c["url"],
+            "Nearest NoBroker Project": c.get("nearest_nb", ""), "Distance (km)": c.get("nearest_km", "")})
+    ALL = pd.DataFrame(combined)
 
     a_cols = {"name": "Project Name", "builder": "Builder (Promoter)", "rera_no": "RERA Number",
-              "project_type": "Project Type", "status": "RERA Status", "locality": "Locality", "street": "Street",
-              "village": "Village/Town", "mandal": "Mandal", "district": "District", "pin": "PIN",
-              "lat": "Latitude", "lon": "Longitude", "coord_source": "Coordinates From",
+              "project_type": "Project Type", "status": "RERA Status", "locality": "Locality", "village": "Village/Town",
+              "mandal": "Mandal", "district": "District", "pin": "PIN",
               "proposed_completion": "Proposed Completion", "revised_completion": "Revised Completion (Possession)",
-              "market_possession": "Possession (listing sites)", "price": "Price", "price_sqft": "Price per sq.ft",
-              "extension_cert": "Extension Certificate", "last_modified": "RERA Last Modified",
-              "nearest_nb": "Nearest NoBroker Project", "nearest_km": "Distance (km)", "in_set_b": "Also on Google Maps",
+              "extension_cert": "Extension Certificate", "listing_price": "Price (listing sites)",
+              "listing_possession": "Possession (listing sites)", "price": "Price (web lookup)",
+              "nearest_nb": "Nearest NoBroker Project", "nearest_km": "Distance (km)",
               "onboarded_as": "Matches NoBroker Project", "onboarded": "Already on NoBroker", "detail_url": "RERA Page"}
-    b_cols = {"name": "Building Name", "category": "Google Category", "address": "Address", "lat": "Latitude",
-              "lon": "Longitude", "builder": "Builder", "rera_no": "RERA Number", "possession": "Possession / Completion",
-              "price": "Price", "price_sqft": "Price per sq.ft",
-              "project_type": "Project Type", "details_from": "Details From", "rating": "Rating", "reviews": "Reviews",
-              "nearest_nb": "Nearest NoBroker Project", "nearest_km": "Distance (km)", "in_set_a": "In RERA Register",
+    c_cols = {"name": "Project Name", "builder": "Builder", "locality": "Location", "rera_no": "RERA ID",
+              "price": "Price", "price_sqft": "Price per sq.ft", "possession": "Possession (listing sites)",
+              "rera_possession": "Possession (RERA)", "sites": "Listed On", "in_set_a": "In RERA Register",
+              "nearest_nb": "Nearest NoBroker Project", "nearest_km": "Distance (km)",
+              "onboarded_as": "Matches NoBroker Project", "onboarded": "Already on NoBroker", "url": "Link"}
+    b_cols = {"name": "Building Name", "category": "Google Category", "address": "Address", "builder": "Builder",
+              "rera_no": "RERA Number", "possession": "Possession / Completion", "price": "Price",
+              "details_from": "Details From", "nearest_nb": "Nearest NoBroker Project", "nearest_km": "Distance (km)",
               "onboarded_as": "Matches NoBroker Project", "onboarded": "Already on NoBroker", "maps_url": "Google Maps"}
-    A = pd.DataFrame([{v: r.get(k, "") for k, v in a_cols.items()} for r in a_rows], columns=list(a_cols.values()))
-    B = pd.DataFrame([{v: r.get(k, "") for k, v in b_cols.items()} for r in b_rows], columns=list(b_cols.values()))
-    a_new, a_on = A[A["Already on NoBroker"] == ""], A[A["Already on NoBroker"] != ""]
-    b_new, b_on = B[B["Already on NoBroker"] == ""], B[B["Already on NoBroker"] != ""]
+    frame = lambda rows, cols: pd.DataFrame([{v: r.get(k, "") for k, v in cols.items()} for r in rows],
+                                            columns=list(cols.values()))
+    A, C, B = frame(a_rows, a_cols), frame(c_rows, c_cols), frame(b_rows, b_cols)
+    new = lambda df: df[df["Already on NoBroker"] == ""]
+    old = lambda df, tag: df[df["Already on NoBroker"] != ""].assign(Set=tag)
     summary = pd.DataFrame([
-        ("RERA projects listed (all districts)", db.c.execute("SELECT COUNT(*) FROM rera_list").fetchone()[0]),
-        ("RERA residential/commercial within %.0f km of NoBroker" % args.radius_km, len(A)),
-        ("Set A - not on NoBroker", len(a_new)), ("Set A - already on NoBroker", len(a_on)),
-        ("Google Maps buildings within %.0f km" % args.radius_km, len(B)),
-        ("Set B - not on NoBroker", len(b_new)), ("Set B - already on NoBroker", len(b_on)),
-        ("Set B matched to a RERA project", int((B["In RERA Register"] == "Yes").sum())),
-        ("Districts collected", ", ".join(d for (d,) in db.c.execute("SELECT district FROM district_done"))),
+        ("ALL NEW PROJECTS (not on NoBroker)", len(ALL)),
+        ("  from RERA register", int(ALL["Found In"].str.startswith("RERA").sum()) if len(ALL) else 0),
+        ("  only on listing sites (not in RERA)", int(ALL["Found In"].str.startswith("listing").sum()) if len(ALL) else 0),
+        ("  with a price", int((ALL["Price"] != "").sum()) if len(ALL) else 0),
+        ("  with a RERA ID", int((ALL["RERA ID"] != "").sum()) if len(ALL) else 0),
+        ("RERA projects listed (all districts)", db.execute("SELECT COUNT(*) FROM rera_list")[0][0]),
+        (f"RERA residential/commercial within {args.radius_km:.0f} km of NoBroker", len(A)),
+        ("RERA already on NoBroker", int((A["Already on NoBroker"] != "").sum())),
+        ("Listing-site projects found", len(C)), ("Listing-site projects already on NoBroker",
+                                                  int((C["Already on NoBroker"] != "").sum())),
+        ("Districts collected", ", ".join(d for (d,) in db.execute("SELECT district FROM district_done"))),
     ], columns=["Metric", "Value"])
     out = Path(args.out)
     with pd.ExcelWriter(out, engine="openpyxl") as xw:
+        ALL.to_excel(xw, sheet_name="All new projects", index=False)
         summary.to_excel(xw, sheet_name="Summary", index=False)
-        a_new.to_excel(xw, sheet_name="A - RERA not on NoBroker", index=False)
-        b_new.to_excel(xw, sheet_name="B - Maps not on NoBroker", index=False)
-        pd.concat([a_on.assign(Set="A - RERA"), b_on.rename(columns={"Building Name": "Project Name"}).assign(Set="B - Maps")],
+        new(A).to_excel(xw, sheet_name="A - RERA not on NoBroker", index=False)
+        new(C).to_excel(xw, sheet_name="C - Listings not on NoBroker", index=False)
+        if len(B):
+            new(B).to_excel(xw, sheet_name="B - Maps not on NoBroker", index=False)
+        pd.concat([old(A, "A - RERA"), old(C, "C - Listings"),
+                   old(B.rename(columns={"Building Name": "Project Name"}), "B - Maps")],
                   ignore_index=True).to_excel(xw, sheet_name="Already on NoBroker", index=False)
         from openpyxl.styles import Font
         for ws in xw.sheets.values():
@@ -833,8 +1086,10 @@ def cmd_build(args, db: DB, fp: Footprint):
             ws.auto_filter.ref = ws.dimensions
             for c in ws[1]:
                 c.font = Font(bold=True)
-                ws.column_dimensions[c.column_letter].width = 18
-    log.info("Wrote %s | Set A new: %d | Set B new: %d", out, len(a_new), len(b_new))
+                ws.column_dimensions[c.column_letter].width = 22
+    log.info("Wrote %s | all new projects: %d (RERA %d, listing-only %d)", out, len(ALL),
+             int(ALL["Found In"].str.startswith("RERA").sum()) if len(ALL) else 0,
+             int(ALL["Found In"].str.startswith("listing").sum()) if len(ALL) else 0)
 
 
 def cmd_status(args, db: DB):
@@ -843,6 +1098,8 @@ def cmd_status(args, db: DB):
     log.info("RERA listed: %d | details: %d | in footprint: %d | certificates read: %d",
              q("SELECT COUNT(*) FROM rera_list"), q("SELECT COUNT(*) FROM rera_detail"),
              sum(1 for d in db.all("rera_detail").values() if d.get("in_footprint")), q("SELECT COUNT(*) FROM rera_cert"))
+    log.info("Listing searches done: %d | project pages: %d", q("SELECT COUNT(*) FROM listing_query"),
+             q("SELECT COUNT(*) FROM listings"))
     log.info("Maps searches done: %d | unique places: %d | enriched: %d", q("SELECT COUNT(*) FROM place_query"),
              q("SELECT COUNT(*) FROM places"), q("SELECT COUNT(*) FROM enrich"))
 
@@ -851,7 +1108,9 @@ def main():
     for s in (sys.stdout, sys.stderr):
         s.reconfigure(encoding="utf-8", errors="replace")
     p = argparse.ArgumentParser(description=__doc__, formatter_class=argparse.RawDescriptionHelpFormatter)
-    p.add_argument("step", choices=["rera-list", "rera-details", "places", "enrich", "build", "status"])
+    p.add_argument("step", choices=["rera-list", "rera-details", "listings", "places", "enrich", "build", "status"])
+    p.add_argument("--sites", nargs="+", default=list(LISTING_SITES), choices=list(LISTING_SITES),
+                   help="listings: which sites to search")
     p.add_argument("--nobroker", default=r"C:\Users\shres\Downloads\buildings.xlsx", help="NoBroker projects workbook")
     p.add_argument("--nobroker-sheet", default="build l")
     p.add_argument("--out", default=r"C:\Users\shres\Downloads\Hyderabad projects not on NoBroker.xlsx")
@@ -881,6 +1140,7 @@ def main():
     fp = Footprint(nb)
     try:
         {"rera-details": lambda: cmd_rera_details(args, db, fp), "places": lambda: cmd_places(args, db, nb),
+         "listings": lambda: cmd_listings(args, db, nb),
          "enrich": lambda: cmd_enrich(args, db, fp), "build": lambda: cmd_build(args, db, fp)}[args.step]()
     except KeyboardInterrupt:
         log.warning("Stopped by you - progress is saved; run the same command to continue.")
