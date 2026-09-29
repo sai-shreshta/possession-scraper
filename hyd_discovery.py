@@ -38,7 +38,7 @@ import truststore
 from bs4 import BeautifulSoup
 
 import extractor as ex
-from possession_scraper import load_env, notify_user, parse_coord, short_locality
+from possession_scraper import keep_awake, load_env, notify_user, parse_coord, short_locality
 
 log = logging.getLogger("hyd")
 
@@ -235,9 +235,9 @@ def cmd_rera_list(args, db: DB):
                 ask(f"[{dname}] District is selected. Type the captcha in the browser and click Search.")
             except Exception:
                 ask(f"[{dname}] Open 'Advanced Search', pick District = {dname}, type the captcha, click Search.")
-            info = wait_for_page(page, 1, timeout=900)
+            info = wait_for_page(page, 1, timeout=3600)
             if not info:
-                log.error("No results for %s within 15 minutes - skipping it for now (re-run to retry).", dname)
+                log.error("No results for %s within 60 minutes - skipping it for now (re-run to retry).", dname)
                 continue
             total, _, last = info
             log.info("[%s] %d projects over %d page(s)", dname, total, last)
@@ -469,6 +469,7 @@ def cmd_places(args, db: DB, nb: pd.DataFrame):
 def set_a_rows(db: DB, fp: Footprint, radius: float) -> list[dict]:
     listed, details = db.all("rera_list"), db.all("rera_detail")
     certs = dict(db.c.execute("SELECT key, rera_no FROM rera_cert"))
+    enrich = db.all("enrich")
     rows = []
     for key, r in listed.items():
         d = details.get(key, {})
@@ -476,9 +477,11 @@ def set_a_rows(db: DB, fp: Footprint, radius: float) -> list[dict]:
             continue
         rn = certs.get(key, "")
         chk = fp.check(r["name"], d.get("lat"), d.get("lon"), rn)
+        e = enrich.get("a:" + key, {})
         rows.append({"key": key, "name": r["name"], "builder": r["promoter"], "rera_no": rn, **d, **chk,
                      "extension_cert": "Yes" if r.get("extension_cert") else "No", "last_modified": r["last_modified"],
-                     "detail_url": r["detail_url"]})
+                     "detail_url": r["detail_url"], "price": e.get("price", ""), "price_sqft": e.get("price_sqft", ""),
+                     "market_possession": e.get("possession", "")})
     return rows
 
 
@@ -512,13 +515,16 @@ def set_b_rows(db: DB, fp: Footprint, a_rows: list[dict], radius: float) -> list
         if a:
             row.update(builder=a["builder"], rera_no=a["rera_no"], possession=a.get("revised_completion") or
                        a.get("proposed_completion", ""), project_type=a.get("project_type", ""),
-                       details_from=f"RERA register ({a['name']})", in_set_a="Yes")
+                       details_from=f"RERA register ({a['name']})", in_set_a="Yes",
+                       price=a.get("price") or enrich.get(cid, {}).get("price", ""),
+                       price_sqft=a.get("price_sqft") or enrich.get(cid, {}).get("price_sqft", ""))
             if a.get("onboarded") and not row["onboarded"]:
                 row.update(onboarded=a["onboarded"], onboarded_as=a["onboarded_as"])
         elif cid in enrich:
             e = enrich[cid]
             row.update(builder=e.get("builder", ""), rera_no=e.get("rera_no", ""), possession=e.get("possession", ""),
-                       details_from="web search", in_set_a="No")
+                       details_from="web search", in_set_a="No", price=e.get("price", ""),
+                       price_sqft=e.get("price_sqft", ""))
             if e.get("rera_no") and e["rera_no"] in fp.rera and not row["onboarded"]:
                 row.update(onboarded="Yes (same RERA number)")
         else:
@@ -527,31 +533,84 @@ def set_b_rows(db: DB, fp: Footprint, a_rows: list[dict], radius: float) -> list
     return rows
 
 
+_UNITS = r"cr|crores?|l|lacs?|lakhs?"
+_PRICE_RANGE = re.compile(rf"(?:₹|rs\.?|inr)\s*(\d+(?:\.\d+)?)\s*({_UNITS})?\s*(?:-|–|to)\s*"
+                          rf"(?:₹|rs\.?|inr)?\s*(\d+(?:\.\d+)?)\s*({_UNITS})\b", re.I)
+_PRICE_ONE = re.compile(rf"(?:₹|rs\.?|inr)\s*(\d+(?:\.\d+)?)\s*({_UNITS})\b", re.I)
+_PER_SQFT = re.compile(r"(?:₹|rs\.?|inr)\s*([\d,]{3,7})\s*(?:/|per)\s*sq\.?\s*ft", re.I)
+
+
+def _amt(num: str, unit: str) -> tuple[float, str]:
+    u = "Cr" if unit.lower().startswith("c") else "L"
+    return float(num) * (100 if u == "Cr" else 1), f"₹{num} {u}"
+
+
+def extract_price(texts: list[str]) -> tuple[str, str]:
+    """('₹1.08 Cr - ₹2.14 Cr', '₹7,500/sq.ft') from listing snippets; empty strings when absent."""
+    rng, singles, sqft = "", [], []
+    for t in texts:
+        if not rng:
+            m = _PRICE_RANGE.search(t)
+            if m:
+                lo = _amt(m.group(1), m.group(2) or m.group(4))
+                hi = _amt(m.group(3), m.group(4))
+                if 5 <= lo[0] <= hi[0] <= 50000:
+                    rng = f"{lo[1]} - {hi[1]}"
+        for m in _PRICE_ONE.finditer(t):
+            a = _amt(m.group(1), m.group(2))
+            if 5 <= a[0] <= 50000:
+                singles.append(a)
+        for m in _PER_SQFT.finditer(t):
+            v = int(m.group(1).replace(",", ""))
+            if 1500 <= v <= 60000:
+                sqft.append(v)
+    if not rng and singles:
+        lo, hi = min(singles), max(singles)
+        rng = f"{lo[1]} - {hi[1]}" if hi[0] > lo[0] * 1.05 else f"{lo[1]} onwards"
+    per = f"₹{sorted(sqft)[len(sqft) // 2]:,}/sq.ft" if sqft else ""
+    return rng, per
+
+
+def web_lookup(c: httpx.Client, name: str, area: str) -> dict:
+    """One Serper web search: builder, RERA number, possession date and price from matching snippets."""
+    j = serper(c, "search", {"q": f"{name} {area} Hyderabad price possession RERA", "gl": "in", "num": 10})
+    m = ex.NameMatcher(name, area, "Hyderabad")
+    cands, rera, builder, texts = [], "", "", []
+    for o in j.get("organic", []):
+        title, snip, url = o.get("title", ""), o.get("snippet", ""), o.get("link", "")
+        if "nobroker.in" in url or m.score(f"{title} {snip}") < 0.6:
+            continue
+        texts.append(f"{title} . {snip}")
+        cands += ex.from_snippet(title, snip, url, m)[0]
+        rera = rera or next(iter(RERA_ID_RE.findall(f"{title} {snip}")), "")
+        b = re.search(r"\bby\s+([A-Z][\w&.'\- ]{2,40}?)(?=\s*(?:[|\-,:(]|in\b|at\b|$))", title)
+        builder = builder or (b.group(1).strip() if b else "")
+    v = ex.aggregate(cands, ex.Counter())
+    price, per_sqft = extract_price(texts)
+    return {"builder": builder, "rera_no": rera, "possession": v.display if v.found else "",
+            "confidence": v.label, "price": price, "price_sqft": per_sqft}
+
+
 def cmd_enrich(args, db: DB, fp: Footprint):
+    """1 credit per project: price for Set A (the register has none); builder/RERA/possession/price for Set B."""
     if not os.getenv("SERPER_API_KEY"):
         sys.exit("SERPER_API_KEY missing in .env")
+    done = set(db.all("enrich"))
     a_rows = set_a_rows(db, fp, args.radius_km)
-    todo = [r for r in set_b_rows(db, fp, a_rows, args.radius_km)
-            if not r["onboarded"] and r.get("in_set_a") == "No" and not r.get("details_from")]
-    log.info("%d Set B buildings need builder/RERA/possession (1 credit each)", len(todo))
+    todo = []
+    if args.only in ("a", "both"):
+        todo += [("a:" + r["key"], r["name"], r.get("locality") or r.get("village") or r.get("mandal") or "")
+                 for r in a_rows if not r["onboarded"]]
+    if args.only in ("b", "both"):
+        todo += [(r["cid"], r["name"], r["address"] or r["found_via"].split(" in ", 1)[-1].replace(" Hyderabad", ""))
+                 for r in set_b_rows(db, fp, a_rows, args.radius_km)
+                 if not r["onboarded"] and r.get("in_set_a") == "No"]
+    todo = [t for t in todo if t[0] not in done]
+    log.info("%d projects to look up on the web (1 credit each)", len(todo))
     with httpx.Client(timeout=30) as c:
         try:
-            for n, r in enumerate(todo, 1):
-                area = r["address"] or r["found_via"].split(" in ", 1)[-1]
-                j = serper(c, "search", {"q": f"{r['name']} {area} RERA possession builder", "gl": "in", "num": 10})
-                m = ex.NameMatcher(r["name"], area, "Hyderabad")
-                cands, rera, builder = [], "", ""
-                for o in j.get("organic", []):
-                    title, snip, url = o.get("title", ""), o.get("snippet", ""), o.get("link", "")
-                    if m.score(f"{title} {snip}") < 0.6:
-                        continue
-                    cands += ex.from_snippet(title, snip, url, m)[0]
-                    rera = rera or next(iter(RERA_ID_RE.findall(f"{title} {snip}")), "")
-                    b = re.search(r"\bby\s+([A-Z][\w&.'\- ]{2,40}?)(?=\s*(?:[|\-,:(]|in\b|at\b|$))", title)
-                    builder = builder or (b.group(1).strip() if b else "")
-                v = ex.aggregate(cands, ex.Counter())
-                db.put("enrich", r["cid"], {"builder": builder, "rera_no": rera,
-                                            "possession": v.display if v.found else "", "confidence": v.label})
+            for n, (key, name, area) in enumerate(todo, 1):
+                db.put("enrich", key, web_lookup(c, name, area))
                 if n % 25 == 0:
                     log.info("enriched %d/%d", n, len(todo))
         except CreditsOut as e:
@@ -575,11 +634,13 @@ def cmd_build(args, db: DB, fp: Footprint):
               "village": "Village/Town", "mandal": "Mandal", "district": "District", "pin": "PIN",
               "lat": "Latitude", "lon": "Longitude", "coord_source": "Coordinates From",
               "proposed_completion": "Proposed Completion", "revised_completion": "Revised Completion (Possession)",
+              "market_possession": "Possession (listing sites)", "price": "Price", "price_sqft": "Price per sq.ft",
               "extension_cert": "Extension Certificate", "last_modified": "RERA Last Modified",
               "nearest_nb": "Nearest NoBroker Project", "nearest_km": "Distance (km)", "in_set_b": "Also on Google Maps",
               "onboarded_as": "Matches NoBroker Project", "onboarded": "Already on NoBroker", "detail_url": "RERA Page"}
     b_cols = {"name": "Building Name", "category": "Google Category", "address": "Address", "lat": "Latitude",
               "lon": "Longitude", "builder": "Builder", "rera_no": "RERA Number", "possession": "Possession / Completion",
+              "price": "Price", "price_sqft": "Price per sq.ft",
               "project_type": "Project Type", "details_from": "Details From", "rating": "Rating", "reviews": "Reviews",
               "nearest_nb": "Nearest NoBroker Project", "nearest_km": "Distance (km)", "in_set_a": "In RERA Register",
               "onboarded_as": "Matches NoBroker Project", "onboarded": "Already on NoBroker", "maps_url": "Google Maps"}
@@ -635,6 +696,7 @@ def main():
     p.add_argument("--terms", nargs="+", default=PLACE_TERMS, help="Google Maps search terms per locality")
     p.add_argument("--pages", type=int, default=2, help="Maps result pages per search (10 places each)")
     p.add_argument("--delay", type=float, default=0.5, help="Seconds between RERA portal requests")
+    p.add_argument("--only", choices=["a", "b", "both"], default="both", help="enrich: which set to look up")
     args = p.parse_args()
 
     out = Path(args.out)
@@ -645,6 +707,8 @@ def main():
     for noisy in ("httpx", "httpx2"):
         logging.getLogger(noisy).setLevel(logging.WARNING)
     db = DB(out.with_name("hyd_discovery.sqlite"))
+    if args.step not in ("status", "build"):
+        keep_awake()
     if args.step == "status":
         return cmd_status(args, db)
     if args.step == "rera-list":
