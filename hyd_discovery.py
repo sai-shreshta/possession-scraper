@@ -550,15 +550,39 @@ def stop_for_credits(e: Exception):
     notify_user()
 
 
+_LOC_JUNK = re.compile(r"\d|\b(near|opp|opposite|beside|behind|besides|ward|survey|sy|plot|road|rd|street|lane"
+                       r"|x ?roads?|junction|circle|main|block|phase|part|beside|adjacent)\b", re.I)
+_LOC_SUFFIX = re.compile(r"\s*(\(.*?\)|\b(village|mandal|municipality|telangana|hyderabad|old village|gp|nagar panchayat)\b)"
+                         r"\s*", re.I)
+
+
+def clean_locality(n: str) -> str:
+    n = _LOC_SUFFIX.sub(" ", n or "")
+    n = re.sub(r"\s+", " ", n).strip(" ,-")
+    return "" if not n or _LOC_JUNK.search(n) or len(n) > 26 or len(ex.norm(n)) < 4 else n
+
+
 def localities(nb: pd.DataFrame, db: DB) -> list[str]:
-    seen, out = set(), []
-    names = [short_locality(a, "hyderabad") for a in nb["locality"]]
-    names += [d.get("locality", "") for d in db.all("rera_detail").values() if d.get("in_footprint")]
-    for n in names:
+    """NoBroker's Hyderabad localities, plus genuinely new ones from RERA addresses. RERA spellings are messy
+    ("KOMPLLY", "Narsingi Telangana", "WARD NO11"), so fragments are dropped and near-duplicates of an area
+    already on the list are skipped."""
+    out, keys = [], []
+    for n in [short_locality(a, "hyderabad") for a in nb["locality"]]:
         k = ex.norm(n)
-        if k and k not in seen and k not in ("hyderabad", "secunderabad", "telangana") and len(k) > 2:
-            seen.add(k)
+        if k and k not in keys and k not in ("hyderabad", "secunderabad", "telangana") and len(k) > 2:
+            keys.append(k)
             out.append(n.strip())
+    for d in db.all("rera_detail").values():
+        if not d.get("in_footprint"):
+            continue
+        n = clean_locality(d.get("locality", ""))
+        k = ex.norm(n)
+        if not k or k in keys:
+            continue
+        if any(SequenceMatcher(None, k, x).ratio() >= 0.85 or (len(k) >= 6 and (k in x or x in k)) for x in keys):
+            continue
+        keys.append(k)
+        out.append(n.title() if n.isupper() else n)
     return out
 
 
@@ -866,9 +890,16 @@ def cmd_listings(args, db: DB, nb: pd.DataFrame):
     locs = localities(nb, db)
     known = {ex.norm(l): l for l in locs}
     done = {q for (q,) in db.execute("SELECT q FROM listing_query")}
+    # A locality searched earlier under a raw RERA spelling ("UPPARPALLY VILLAGE") counts as done for "Upparpally".
+    done_keys = set()
+    for q in done:
+        m = re.match(r"site:(\S+) (.+) Hyderabad project price possession$", q)
+        if m:
+            done_keys.add((m.group(1), ex.norm(clean_locality(m.group(2)) or m.group(2))))
     queries = [(site, l, f"site:{LISTING_SITES[site][0]} {l} Hyderabad project price possession")
                for l in locs for site in args.sites]
-    todo = [t for t in queries if t[2] not in done]
+    todo = [t for t in queries if t[2] not in done
+            and (LISTING_SITES[t[0]][0], ex.norm(clean_locality(t[1]) or t[1])) not in done_keys]
     log.info("%d localities x %d sites = %d searches (%d done, %d to go, ~%d credits), %d at a time",
              len(locs), len(args.sites), len(queries), len(queries) - len(todo), len(todo), len(todo),
              args.search_workers)
