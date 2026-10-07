@@ -38,9 +38,46 @@ COL_HINTS = {
     "city": ["city", "town", "district"],
     "lat": ["latitude", "lat"],
     "lon": ["longitude", "lng", "lon", "long"],
-    "rera": ["rera id", "rera number", "rera no", "rera registration", "rera"],
-    "existing": ["possession date", "possession"],
+    "rera": ["rera id", "reraid", "rera number", "rera no", "rera registration", "rera"],
+    "existing": ["possession date", "possession", "completiondate", "completion date"],
+    "min_price": ["longminprice", "min price", "minprice"],
+    "max_price": ["longmaxprice", "max price", "maxprice"],
 }
+
+# Offline city from coordinates (most rows have no city column). Nearest centre relative to its radius wins,
+# so Thane / Navi Mumbai points don't get labelled Mumbai.
+CITY_CENTERS = [
+    ("Bangalore", 12.9716, 77.5946, 45), ("Hyderabad", 17.3850, 78.4867, 45), ("Chennai", 13.0827, 80.2707, 45),
+    ("Mumbai", 19.0760, 72.8777, 25), ("Thane", 19.2183, 72.9781, 14), ("Navi Mumbai", 19.0330, 73.0297, 16),
+    ("Mira Bhayandar", 19.2952, 72.8544, 7), ("Vasai Virar", 19.4259, 72.8225, 13),
+    ("Kalyan Dombivli", 19.2350, 73.1300, 12), ("Panvel", 18.9894, 73.1175, 11), ("Pune", 18.5204, 73.8567, 35),
+    ("Gurgaon", 28.4595, 77.0266, 20), ("Noida", 28.5355, 77.3910, 13), ("Greater Noida", 28.4744, 77.5040, 15),
+    ("Ghaziabad", 28.6692, 77.4538, 14), ("Faridabad", 28.4089, 77.3178, 15), ("Delhi", 28.6139, 77.2090, 22),
+    ("Kolkata", 22.5726, 88.3639, 30), ("Ahmedabad", 23.0225, 72.5714, 30), ("Gandhinagar", 23.2156, 72.6369, 12),
+    ("Chandigarh", 30.7333, 76.7794, 20), ("Coimbatore", 11.0168, 76.9558, 25), ("Kochi", 9.9312, 76.2673, 25),
+    ("Jaipur", 26.9124, 75.7873, 25), ("Lucknow", 26.8467, 80.9462, 25), ("Indore", 22.7196, 75.8577, 20),
+    ("Nagpur", 21.1458, 79.0882, 20), ("Nashik", 19.9975, 73.7898, 15), ("Surat", 21.1702, 72.8311, 20),
+    ("Vadodara", 22.3072, 73.1812, 18), ("Mysore", 12.2958, 76.6394, 15), ("Visakhapatnam", 17.6868, 83.2185, 20),
+    ("Bhubaneswar", 20.2961, 85.8245, 18), ("Goa", 15.4909, 73.8278, 40),
+]
+
+
+def city_from_coords(lat: str, lon: str) -> str:
+    import math
+    try:
+        la, lo = float(lat), float(lon)
+    except ValueError:
+        return ""
+    if not (6 <= la <= 37 and 68 <= lo <= 98) and (6 <= lo <= 37 and 68 <= la <= 98):
+        la, lo = lo, la  # swapped columns
+    best, best_ratio = "", 1.0
+    for name, cla, clo, r in CITY_CENTERS:
+        dy = (la - cla) * 111.0
+        dx = (lo - clo) * 111.0 * math.cos(math.radians(cla))
+        ratio = math.hypot(dx, dy) / r
+        if ratio <= best_ratio:
+            best, best_ratio = name, ratio
+    return best
 
 OUT_COLS = {
     "display": "Possession Date",
@@ -71,6 +108,7 @@ class Store:
             CREATE INDEX IF NOT EXISTS results_key ON results(rkey);
             CREATE TABLE IF NOT EXISTS search_cache(q TEXT PRIMARY KEY, backend TEXT, results TEXT, ts TEXT);
             CREATE TABLE IF NOT EXISTS geo(latlon TEXT PRIMARY KEY, locality TEXT, city TEXT);
+            CREATE TABLE IF NOT EXISTS api_cache(k TEXT PRIMARY KEY, data TEXT);
             CREATE TABLE IF NOT EXISTS claude(row_idx INTEGER PRIMARY KEY, rkey TEXT, data TEXT, updated TEXT);
             CREATE INDEX IF NOT EXISTS claude_key ON claude(rkey);
         """)
@@ -100,6 +138,19 @@ class Store:
             q += " WHERE found=1"
         elif retry == "low":
             q += " WHERE found=1 AND label IN ('High','Medium')"
+        elif retry == "skipped-only":
+            return {i for i, d in self.db.execute("SELECT row_idx, data FROM results")
+                    if json.loads(d).get("label") == "Skipped"}
+        elif retry == "incomplete":
+            # full mode: done = both possession and price confirmed (or a row skipped as not-a-project)
+            out = set()
+            for idx, d in self.db.execute("SELECT row_idx, data FROM results"):
+                d = json.loads(d)
+                if d.get("label") == "Skipped" or (
+                        d.get("found") and d.get("label") in ("High", "Medium")
+                        and d.get("price_label") in ("High", "Medium")):
+                    out.add(idx)
+            return out
         return {r[0] for r in self.db.execute(q)}
 
     def forget_domain(self, domain: str) -> int:
@@ -141,6 +192,14 @@ class Store:
 
     def get_geo(self, key: str):
         return self.db.execute("SELECT locality, city FROM geo WHERE latlon=?", (key,)).fetchone()
+
+    def get_api(self, k: str):
+        r = self.db.execute("SELECT data FROM api_cache WHERE k=?", (k,)).fetchone()
+        return json.loads(r[0]) if r else None
+
+    def put_api(self, k: str, data):
+        self.db.execute("INSERT OR REPLACE INTO api_cache VALUES(?,?)", (k, json.dumps(data, ensure_ascii=False)))
+        self.db.commit()
 
     def put_geo(self, key: str, loc: str, city: str):
         self.db.execute("INSERT OR REPLACE INTO geo VALUES(?,?,?)", (key, loc, city))
@@ -267,7 +326,9 @@ def row_fields(df: pd.DataFrame, cols: dict, i: int) -> dict:
     def val(key):
         return cell(df.iat[i, df.columns.get_loc(cols[key])]) if cols.get(key) is not None else ""
     address = val("locality")
-    city = val("city") or city_from_address(address)
+    # Coordinates first: the part of an address before the state is often a village ("Thornahalli").
+    city = val("city") or city_from_coords(parse_coord(val("lat")), parse_coord(val("lon"))) \
+        or city_from_address(address)
     rera_raw = val("rera")
     return {"name": _NAME_PREFIX.sub("", _NAME_NOISE.sub("", val("name"))).strip(), "address": address,
             "loc": short_locality(address, city), "city": city,
@@ -277,7 +338,8 @@ def row_fields(df: pd.DataFrame, cols: dict, i: int) -> dict:
 
 def split_rera(v: str) -> list[str]:
     """Some rows hold several IDs: 'UPRERAPRJ9689 | UPRERAPRJ9214'. Karnataka IDs contain slashes, so no '/' split."""
-    return [x.strip() for x in re.split(r"[|,;\n]+", v or "") if len(x.strip()) >= 5]
+    v = re.sub(r"\s+dated\b[^|,;\n]*", "", v or "", flags=re.I)  # 'TN/01/Layout/506/2021 dated 14/12/2021'
+    return [x.strip() for x in re.split(r"[|,;\n]+|\s+(?:I|l|and|&)\s+", v) if len(x.strip()) >= 5]
 
 
 def build_rera_queries(name: str, loc: str, city: str, rera_ids: list[str]) -> list[str]:
@@ -320,6 +382,25 @@ def build_queries(name: str, loc: str, city: str, rera: str = "") -> list[str]:
     return out
 
 
+PORTAL_SITES = "site:99acres.com OR site:magicbricks.com OR site:housing.com OR site:squareyards.com"
+
+
+def build_full_queries(name: str, loc: str, city: str, rera_ids: list[str]) -> list[str]:
+    """Possession + price. Portal project pages carry both, so the first two searches aim at them."""
+    place = " ".join(x for x in (loc, city) if x)
+    qs = [f"{name} {place} price possession",
+          f"{name} {place} {PORTAL_SITES}",
+          f"\"{rera_ids[0]}\"" if rera_ids else f"\"{name}\" {city} possession date price",
+          f"{name} {city} project price per sq.ft possession"]
+    out, seen = [], set()
+    for q in qs:
+        q = re.sub(r"\s+", " ", q).strip()
+        if q.lower() not in seen:
+            seen.add(q.lower())
+            out.append(q)
+    return out
+
+
 # ----------------------------------------------------------------------------- scraping
 
 class Ctx:
@@ -327,18 +408,24 @@ class Ctx:
         self.args, self.store, self.client, self.search, self.fetcher = args, store, client, search, fetcher
         self.excluded = [d.strip().lower() for d in (args.exclude_domains or "").split(",") if d.strip()]
         self.geo_lock = asyncio.Lock()
+        self.paid = 0
+        self.pt_lock = asyncio.Lock()
+        self.pt_last, self.pt_blocks, self.pt_fail_streak = 0.0, 0, 0
         self.geo_last = 0.0
 
 
 def pick_pages(results: list[SearchResult], m: ex.NameMatcher, seen: set, k: int) -> list[SearchResult]:
     scored = []
     for r in results:
-        if r.url in seen or PageFetcher.skippable(r.url):
+        if r.url in seen or PageFetcher.skippable(r.url) or ex.url_rejected(r.url):
             continue
-        match = m.score(f"{r.title} {r.snippet}")
-        if match < 0.5:
+        if ex.city_conflict(f"{r.title} {r.url}", m.city):
             continue
-        scored.append((ex.domain_weight(r.url)[0] + match, r))
+        match = 1.0 if m.id_in(f"{r.title} {r.snippet}") else m.score(r.title)
+        if match < 0.6:
+            continue
+        trusted = ex.source_tier(r.url, m) in ex.TRUSTED_TIERS
+        scored.append((trusted + ex.domain_weight(r.url)[0] + match, r))
     scored.sort(key=lambda t: t[0], reverse=True)
     return [r for _, r in scored[:k]]
 
@@ -358,23 +445,220 @@ def evidence_pack(m: ex.NameMatcher, results: list[SearchResult], cands: list[ex
                        "text": c.context[:250]} for c in top]}
 
 
-async def scrape_building(ctx: Ctx, name: str, loc: str, city: str,
-                          rera_ids: list[str]) -> tuple[ex.Verdict, dict, dict]:
+def namesake_check(verdict: ex.Verdict, cands: list, prices: list) -> list:
+    """A page whose possession date is over a year away from the confirmed one is about a namesake
+    project (e.g. same name, other locality) - its price is shown only as unconfirmed."""
+    if not (verdict.found and verdict.label in ("High", "Medium") and len(verdict.iso) == 7):
+        return prices
+    want = int(verdict.iso[:4]) * 12 + int(verdict.iso[5:])
+    by_url: dict[str, list[int]] = {}
+    for c in cands:
+        if c.month:
+            by_url.setdefault(c.url, []).append(abs(c.year * 12 + c.month - want))
+    off = {u for u, gaps in by_url.items() if min(gaps) > 12}
+    for p in prices:
+        if p.url in off and p.trusted:
+            p.trusted = False
+            p.context = f"(possession on this page differs - maybe another project) {p.context}"
+    return prices
+
+
+PT_TYPEAHEAD = "https://www.proptiger.com/columbus/app/v6/typeahead"
+PT_DETAIL = "https://www.proptiger.com/app/v4/project-detail/{}"
+PT_MAX_KM = 3.0
+PT_INTERVAL = 0.8      # seconds between PropTiger requests
+PT_PAUSE = 600         # pause when PropTiger starts refusing
+PT_MAX_PAUSES = 6
+
+
+class BudgetReached(Exception):
+    """--budget paid searches used; the row is left unsaved so a later run continues from it."""
+
+
+class PropTigerBlocked(Exception):
+    """PropTiger keeps refusing; the row is left unsaved so a later run redoes it."""
+PT_STALE_MONTHS = 24
+
+
+def _km(lat1, lon1, lat2, lon2) -> float:
+    import math
+    dy = (lat1 - lat2) * 111.0
+    dx = (lon1 - lon2) * 111.0 * math.cos(math.radians(lat2))
+    return math.hypot(dx, dy)
+
+
+async def _pt_get(ctx: Ctx, url: str, params: dict | None = None):
+    k = url + "?" + json.dumps(params or {}, sort_keys=True)
+    hit = ctx.store.get_api(k)
+    if hit is not None:
+        return hit
+    # One request at a time, spaced out: PropTiger blocks an IP that sends ~10 requests a second.
+    async with ctx.pt_lock:
+        attempt = 0
+        while True:
+            wait = ctx.pt_last + PT_INTERVAL - time.monotonic()
+            if wait > 0:
+                await asyncio.sleep(wait)
+            ctx.pt_last = time.monotonic()
+            try:
+                r = await ctx.client.get(url, params=params)
+            except httpx.HTTPError:
+                r = None
+            if r is not None and r.status_code == 200:
+                ctx.pt_blocks = ctx.pt_fail_streak = 0
+                try:
+                    data = r.json()
+                except ValueError:
+                    data = {}
+                ctx.store.put_api(k, data)
+                return data
+            if r is not None and r.status_code in (404, 400):
+                ctx.store.put_api(k, {})
+                return {}
+            if r is not None and r.status_code in (403, 429):
+                ctx.pt_blocks += 1
+                if ctx.pt_blocks > PT_MAX_PAUSES:
+                    raise PropTigerBlocked(f"HTTP {r.status_code} after {PT_MAX_PAUSES} pauses")
+                log.warning("PropTiger is refusing requests (HTTP %d) - pausing %d min before trying again (%d/%d). "
+                            "Nothing is marked 'not found' meanwhile.", r.status_code, PT_PAUSE // 60,
+                            ctx.pt_blocks, PT_MAX_PAUSES)
+                await asyncio.sleep(PT_PAUSE)
+                continue
+            attempt += 1
+            if attempt >= 3:
+                # One project's page erroring (HTTP 500) is normal - skip it (the paid pass can still find it).
+                # Only many failures in a row mean PropTiger itself is down.
+                ctx.pt_fail_streak += 1
+                if ctx.pt_fail_streak >= 15:
+                    raise PropTigerBlocked(f"no answer for 15 projects in a row "
+                                           f"(last: {r.status_code if r is not None else 'network error'})")
+                return {}
+            await asyncio.sleep(3 * attempt)
+
+
+async def proptiger_lookup(ctx: Ctx, m: ex.NameMatcher, name: str, city: str, lat: str, lon: str,
+                           rera_ids: list[str]) -> tuple[list, list, str]:
+    """Free: PropTiger's own project search + project data. A result is accepted when the name matches AND
+      - its RERA number equals the sheet's (then up to 60 km off - sheet coordinates are often area centres), or
+      - it is within 3 km of the sheet's coordinates, or
+      - it is within 8 km, the name matches closely and the sheet's locality is in PropTiger's address.
+    A different RERA number of the same format always rejects it. Returns (date cands, price cands, note)."""
+    try:
+        la, lo = float(lat), float(lon)
+    except ValueError:
+        la = lo = None
+    mine = {re.sub(r"[^a-z0-9]", "", r.lower()) for r in rera_ids}
+
+    def options(j) -> list:
+        out = []
+        for d in (j or {}).get("data") or []:
+            if d.get("type") != "PROJECT" or not d.get("entityId"):
+                continue
+            label = f"{d.get('displayText', '')} {d.get('redirectUrl', '')}"
+            s = max(m.score(d.get("displayText", "")), m.score(f"{d.get('builderName', '')} {d.get('entityName', '')}"))
+            if s < 0.8 or ex.sector_conflict(label, m):
+                continue
+            if la is not None and d.get("latitude") and d.get("longitude"):
+                km = _km(la, lo, float(d["latitude"]), float(d["longitude"]))
+            elif ex.norm(d.get("city", "")) in ex.city_names_for(city):
+                km = PT_MAX_KM
+            else:
+                continue
+            if km <= 60:
+                out.append((s, km, d))
+        return sorted(out, key=lambda t: (-t[0], t[1]))[:2]
+
+    q = {"typeAheadType": "project", "rows": 6, "sourceDomain": "Proptiger", "view": "buyer", "category": "buy"}
+    found = options(await _pt_get(ctx, PT_TYPEAHEAD, {**q, "query": name}))
+    rera_only = False
+    base = re.sub(r"\s*\b(?:phase|ph|tower|wing|block|stage)\s*[-.]?\s*(?:[ivx]+|\d+[a-z]?)\b\.?\s*$", "", name,
+                  flags=re.I).strip()
+    if not found and base and base != name and mine:
+        # "X Phase 2" unknown to PropTiger: try "X", but then only an exact RERA match will do.
+        found, rera_only = options(await _pt_get(ctx, PT_TYPEAHEAD, {**q, "query": base})), True
+    pick = None
+    for s, km, d in found:
+        det = ((await _pt_get(ctx, PT_DETAIL.format(d["entityId"]))) or {}).get("data") or {}
+        if not det:
+            continue
+        rera = str(det.get("reraRegistrationNumber") or "")
+        rera_n = re.sub(r"[^a-z0-9]", "", rera.lower())
+        same_rera = bool(mine) and len(rera_n) >= 6 and any(rera_n in x or x in rera_n for x in mine)
+        if mine and re.search(r"\d{4}", rera) and not same_rera and \
+                any(ex._id_shape(r).fullmatch(rera.strip()) for r in rera_ids):
+            continue  # another project / phase
+        near_ok = km <= PT_MAX_KM or (km <= 8 and s >= 0.9 and m.place_in(d.get("displayText", "")))
+        if same_rera or (near_ok and not rera_only):
+            pick = (s, km, d, det, rera, same_rera)
+            break
+    if not pick:
+        return [], [], ""
+    s, km, d, det, rera, same_rera = pick
+    url = "https://www.proptiger.com/" + d.get("redirectUrl", "").lstrip("/")
+    where = d.get("displayText", "") + (f" ({km:.1f} km from sheet location)" if la is not None else "") + \
+        (" - RERA number matches the sheet" if same_rera else "")
+    updated = det.get("lastUpdatedDate")
+    upd_txt = datetime.fromtimestamp(updated / 1000).strftime("%b %Y") if updated else "unknown"
+    stale = bool(updated) and (time.time() - updated / 1000) / (30.4 * 86400) > PT_STALE_MONTHS
+    cands, prices = [], []
+    pos = det.get("possessionDate") or det.get("currentPhaseCompletionDate")
+    if pos:
+        dt = datetime.fromtimestamp(pos / 1000)
+        ctxt = (f"PropTiger project data: possession {dt:%b %Y}, status {det.get('projectStatus', '')}, "
+                f"RERA {rera or '-'}, listing updated {upd_txt} - {where}")
+        cands.append(ex.Candidate(dt.year, dt.month, "month", "structured", 0.85, url, "proptiger.com", ctxt,
+                                  False, True, "PropTiger data"))
+    if det.get("shouldDisplayPrice", True):
+        p_lo = det.get("minAgreementPrice") or det.get("minPrice")
+        p_hi = det.get("maxAgreementPrice") or det.get("maxPrice") or p_lo
+        per = int(det.get("minPricePerUnitArea") or 0)
+        if p_lo and ex.MIN_PRICE <= p_lo <= p_hi <= ex.MAX_PRICE:
+            note = f" - price not updated since {upd_txt}, may be old" if stale else ""
+            prices.append(ex.PriceCand(float(p_lo), float(p_hi), "page data", url, "proptiger.com", not stale, 0.85,
+                                       "PropTiger data", f"PropTiger builder price, updated {upd_txt}{note} - {where}",
+                                       per if 1000 <= per <= 150000 else 0))
+    return cands, prices, ""
+
+
+async def scrape_building(ctx: Ctx, name: str, loc: str, city: str, rera_ids: list[str],
+                          lat: str = "", lon: str = "") -> tuple[ex.Verdict, dict, dict]:
     a = ctx.args
-    rera_mode = a.mode == "rera"
+    rera_mode, full_mode = a.mode == "rera", a.mode == "full"
     m = ex.NameMatcher(name, loc, city, tuple(rera_ids))
     cands, statuses, seen, all_results = [], ex.Counter(), set(), []
     pairs: list | None = [] if rera_mode else None
-    verdict, n_q, pages_left = ex.Verdict(), 0, a.max_pages
-    queries = (build_rera_queries(name, loc, city, rera_ids) if rera_mode
-               else build_queries(name, loc, city, rera_ids[0] if rera_ids else ""))
+    prices: list | None = [] if full_mode else None
+    verdict, n_q, pages_left, price = ex.Verdict(), 0, a.max_pages, {}
+    if rera_mode:
+        queries = build_rera_queries(name, loc, city, rera_ids)
+    elif full_mode:
+        queries = build_full_queries(name, loc, city, rera_ids)
+    else:
+        queries = build_queries(name, loc, city, rera_ids[0] if rera_ids else "")
+    if full_mode and not a.no_proptiger:
+        c, p, note = await proptiger_lookup(ctx, m, name, city, lat, lon, rera_ids)
+        cands += c
+        prices += p
+        if c or p:
+            verdict = ex.aggregate(cands, statuses)
+            price = ex.aggregate_price(prices)
+            if verdict.label in ("High", "Medium") and price["price_label"] in ("High", "Medium") \
+                    and price["price_min"]:
+                verdict.queries = 0
+                return verdict, evidence_pack(m, [], cands), price
     for q in queries[: a.max_queries]:
+        if ctx.store.get_search(q) is None:  # a cached search costs nothing
+            if a.budget is not None and ctx.paid >= a.budget:
+                if a.retry == "complete":
+                    break  # a re-check never searches anew; it keeps what free/cached sources give
+                raise BudgetReached
+            ctx.paid += 1
         results = [r for r in await ctx.search.search(ctx.client, q)
                    if not any(dom in r.url.lower() for dom in ctx.excluded)]
         all_results += results
         n_q += 1
         for r in results:
-            c, s = ex.from_snippet(r.title, r.snippet, r.url, m, pairs)
+            c, s = ex.from_snippet(r.title, r.snippet, r.url, m, pairs, prices)
             cands += c
             statuses.update(s)
         for r in pick_pages(results, m, seen, min(a.pages_per_query, pages_left)):
@@ -382,15 +666,21 @@ async def scrape_building(ctx: Ctx, name: str, loc: str, city: str,
             pages_left -= 1
             html = await ctx.fetcher.fetch(r.url)
             if html:
-                c, s = await asyncio.to_thread(ex.from_page, html, r.url, m, pairs)
+                c, s = await asyncio.to_thread(ex.from_page, html, r.url, m, pairs, prices)
                 cands += c
                 statuses.update(s)
         verdict = ex.aggregate(cands, statuses)
+        if full_mode:
+            price = ex.aggregate_price(namesake_check(verdict, cands, prices))
+            # Both answers confirmed by a trusted site - no need to spend another search.
+            if verdict.label == "High" and price["price_label"] in ("High", "Medium") and price["price_min"]:
+                break
         # RERA mode keeps searching: the latest extension is often only on a later result.
-        if verdict.label == "High" and not rera_mode:
+        elif verdict.label == "High" and not rera_mode:
             break
     verdict.queries = n_q
-    return verdict, evidence_pack(m, all_results, cands), (ex.rera_summary(cands, pairs) if rera_mode else {})
+    extra = ex.rera_summary(cands, pairs) if rera_mode else price
+    return verdict, evidence_pack(m, all_results, cands), extra
 
 
 async def reverse_geocode(ctx: Ctx, lat: str, lon: str) -> tuple[str, str]:
@@ -454,9 +744,11 @@ def keep_awake():
     """Stop Windows from sleeping while the scraper runs (closing the lid still sleeps)."""
     if sys.platform == "win32":
         import ctypes
-        ES_CONTINUOUS, ES_SYSTEM_REQUIRED = 0x80000000, 0x00000001
-        ctypes.windll.kernel32.SetThreadExecutionState(ES_CONTINUOUS | ES_SYSTEM_REQUIRED)
-        log.info("Keeping the PC awake while this runs")
+        ES_CONTINUOUS, ES_SYSTEM_REQUIRED, ES_DISPLAY_REQUIRED = 0x80000000, 0x00000001, 0x00000002
+        # Laptops with Modern Standby go to sleep when the screen times out, whatever ES_SYSTEM_REQUIRED says;
+        # keeping the display on is what holds them awake.
+        ctypes.windll.kernel32.SetThreadExecutionState(ES_CONTINUOUS | ES_SYSTEM_REQUIRED | ES_DISPLAY_REQUIRED)
+        log.info("Keeping the PC awake while this runs (screen stays on; closing the lid still sleeps it)")
 
 
 async def worker(ctx: Ctx, queue: asyncio.Queue, prog: Progress, export_cb):
@@ -465,7 +757,8 @@ async def worker(ctx: Ctx, queue: asyncio.Queue, prog: Progress, export_cb):
         if item is None:
             queue.task_done()
             return
-        idx, name, loc, city, lat, lon, rera = item
+        idxs, name, loc, city, lat, lon, rera = item
+        idx = idxs[0]
         try:
             if not name:
                 data = ex.Verdict(note="empty building name").as_dict()
@@ -477,18 +770,26 @@ async def worker(ctx: Ctx, queue: asyncio.Queue, prog: Progress, export_cb):
                     g_loc, city = await reverse_geocode(ctx, lat, lon)
                     loc = loc or g_loc
                 rkey = row_key(name, loc, city)
-                data = ctx.store.by_key(rkey)
+                # Reuse an earlier run's result for the same project - except when retrying, where that
+                # earlier result is exactly what is being redone.
+                data = None if ctx.args.retry else ctx.store.by_key(rkey)
                 if data:
                     data = {**data, "note": "same building as another row"}
                 else:
-                    verdict, pack, rera_info = await scrape_building(ctx, name, loc, city, rera)
-                    data = {**verdict.as_dict(), **rera_info, "pack": pack, "locality_used": loc, "city_used": city}
-            ctx.store.save(idx, row_key(name, loc, city), data)
-            log.info("%s | %s (%s) -> %s [%s]", prog.tick(bool(data.get("found"))), name,
-                     ", ".join(x for x in (loc, city) if x), data.get("display") or "not found",
-                     data.get("label"))
+                    verdict, pack, extra = await scrape_building(ctx, name, loc, city, rera, lat, lon)
+                    data = {**verdict.as_dict(), **extra, "pack": pack, "locality_used": loc, "city_used": city}
+            for i, n in enumerate(idxs):
+                ctx.store.save(n, row_key(name, loc, city), data if i == 0 else
+                               {**data, "note": (data.get("note") or "same project as row %d" % (idx + 2))})
+            price = f" | price {data.get('price_display') or data.get('price_sqft') or '-'} [{data.get('price_label')}]" \
+                if ctx.args.mode == "full" else ""
+            prog.done += len(idxs) - 1  # repeats are done without a search
+            prog.found += (len(idxs) - 1) * bool(data.get("found"))
+            log.info("%s | %s (%s)%s -> %s [%s]%s", prog.tick(bool(data.get("found"))), name,
+                     ", ".join(x for x in (loc, city) if x), f" x{len(idxs)}" if len(idxs) > 1 else "",
+                     data.get("display") or "not found", data.get("label"), price)
             await export_cb(prog.done)
-        except (AllBackendsDisabled, CreditsExhausted):
+        except (AllBackendsDisabled, CreditsExhausted, PropTigerBlocked, BudgetReached):
             raise  # this row is not saved, so it is redone on the next run
         except Exception as e:
             log.exception("row %s (%s) failed: %s", idx, name, e)
@@ -510,7 +811,9 @@ def parse_sheet_date(v: str) -> tuple[int, int] | None:
     v = cell(v)
     if not v:
         return None
-    if re.fullmatch(r"\d{5}(\.\d+)?", v):
+    if re.fullmatch(r"\d{12,13}|\d{9,10}", v):
+        ts = pd.Timestamp(int(v) // (1000 if len(v) >= 12 else 1), unit="s")  # epoch (ms) from an export
+    elif re.fullmatch(r"\d{5}(\.\d+)?", v):
         ts = pd.Timestamp("1899-12-30") + pd.Timedelta(days=float(v))
     else:
         pd_ = ex.parse_first_date(v)
@@ -544,13 +847,94 @@ def compare_dates(sheet: tuple[int, int] | None, web_iso: str) -> tuple[str, str
     return shown, verdict, diff
 
 
+def sheet_price(v) -> float | None:
+    """Price already in the sheet -> rupees. Handles plain rupees (8500000), '85 L', '1.2 Cr'."""
+    v = cell(v).replace(",", "")
+    if not v:
+        return None
+    m = re.fullmatch(r"(\d+(?:\.\d+)?)(?:\s*(cr|crores?|l|lacs?|lakhs?))?", v.strip(), re.I)
+    if not m:
+        return None
+    num, unit = float(m.group(1)), (m.group(2) or "").lower()
+    if unit:
+        num *= 1e7 if unit.startswith("c") else 1e5
+    return num if num >= 1e5 else None
+
+
+def compare_price(sheet_lo: float | None, sheet_hi: float | None, web_lo, web_hi) -> str:
+    if not web_lo:
+        return "No web price" if (sheet_lo or sheet_hi) else ""
+    if not (sheet_lo or sheet_hi):
+        return "No sheet price"
+    s, w = (sheet_lo or sheet_hi), float(web_lo)
+    diff = (w - s) / s * 100
+    if abs(diff) <= 15:
+        return "Match (within 15%)"
+    return f"Web {'higher' if diff > 0 else 'lower'} by {abs(diff):.0f}%"
+
+
+def full_row(d: dict | None, sheet_date, sheet_lo, sheet_hi) -> dict:
+    """--mode full: possession + price, each with exactly one source URL. Low-confidence answers (only seen
+    on unverified sites) are kept apart so they are never mistaken for confirmed ones."""
+    d = d or {}
+    done = bool(d)
+    pos_ok = d.get("found") and d.get("label") in ("High", "Medium")
+    pr_ok = d.get("price_label") in ("High", "Medium")
+    pos_low = d.get("found") and d.get("label") == "Low"
+    pr_low = d.get("price_label") == "Low"
+    if d.get("label") == "Skipped":
+        pos_txt = "Skipped - not a project"
+    else:
+        pos_txt = d.get("display") if pos_ok else ("Not found" if done else "")
+    shown, verdict, diff = compare_dates(sheet_date, d.get("iso", "") if pos_ok else "")
+    return {
+        "Possession Date": pos_txt,
+        "Possession (YYYY-MM)": d.get("iso", "") if pos_ok else "",
+        "Project Status": d.get("status", "") if pos_ok else "",
+        "Possession Confidence": d.get("label", "") if done else "",
+        "Possession Source URL": d.get("best_url", "") if pos_ok else "",
+        "Possession Evidence": d.get("evidence", "") if pos_ok else "",
+        "RERA Date": d.get("rera_date", "") if pos_ok else "",
+        "Price": d.get("price_display", "") if pr_ok else ("Not found" if done and not pr_low else ""),
+        "Price Min (Rs)": d.get("price_min", "") if pr_ok else "",
+        "Price Max (Rs)": d.get("price_max", "") if pr_ok else "",
+        "Price per sq.ft": d.get("price_sqft", "") if pr_ok else "",
+        "Price Confidence": d.get("price_label", "") if done else "",
+        "Price Source URL": d.get("price_url", "") if pr_ok else "",
+        "Price Evidence": d.get("price_evidence", "") if pr_ok else "",
+        "Sheet Completion Date": shown,
+        "Web vs Sheet (date)": verdict,
+        "Date Difference (months)": diff,
+        "Sheet Price": " - ".join(ex.fmt_inr(x) for x in dict.fromkeys(p for p in (sheet_lo, sheet_hi) if p)),
+        "Web vs Sheet (price)": compare_price(sheet_lo, sheet_hi, d.get("price_min") if pr_ok else "",
+                                              d.get("price_max") if pr_ok else ""),
+        "Unconfirmed Possession (check)": d.get("display", "") if pos_low else "",
+        "Unconfirmed Possession Source": d.get("best_url", "") if pos_low else "",
+        "Unconfirmed Price (check)": (d.get("price_display") or d.get("price_sqft", "")) if pr_low else "",
+        "Unconfirmed Price Source": d.get("price_url", "") if pr_low else "",
+        "Other Dates Seen": d.get("alternatives", ""),
+        "Other Prices Seen": d.get("price_alternatives", ""),
+        "Searches Used": d.get("queries", ""),
+        "Note": d.get("note", ""),
+    }
+
+
 def export(src: Path, sheet, df: pd.DataFrame, results: dict[int, dict], out_sheet: str, backup_done: list,
            claude: dict[int, dict] | None = None, existing_col=None, mode: str = "possession",
-           summary_sheet: str = "Possession Summary"):
+           summary_sheet: str = "Possession Summary", price_cols: tuple = (None, None)):
     claude = claude or {}
     rows, verdicts, rera_verdicts = [], [], []
     for i in range(len(df)):
         d = results.get(i)
+        if mode == "full":
+            def col(c):
+                return df.iat[i, df.columns.get_loc(c)] if c is not None else ""
+            r = full_row(d, parse_sheet_date(col(existing_col)), sheet_price(col(price_cols[0])),
+                         sheet_price(col(price_cols[1])))
+            if d is not None:
+                verdicts.append(r["Web vs Sheet (date)"])
+            rows.append(r)
+            continue
         if d is None:
             r = {v: "" for v in OUT_COLS.values()}
         else:
@@ -615,6 +999,22 @@ def export(src: Path, sheet, df: pd.DataFrame, results: dict[int, dict], out_she
                     ("Web vs sheet: same year (web has year only)", verdicts.count("Same year")),
                     ("Web found a date where sheet has none", verdicts.count("No sheet date")),
                     ("Sheet has a date the web didn't find", verdicts.count("No web date"))]
+    if mode == "full":
+        vals = list(results.values())
+        pl = [d.get("price_label", "") for d in vals]
+        metrics[2:8] = [
+            ("Possession confirmed (High/Medium)", sum(1 for d in vals if d.get("found")
+                                                       and d.get("label") in ("High", "Medium"))),
+            ("  of which High", labels.count("High")), ("  of which Medium", labels.count("Medium")),
+            ("Possession unconfirmed (only unverified sites - check)", labels.count("Low")),
+            ("Possession not found", labels.count("Not found")),
+            ("Price confirmed (High/Medium)", pl.count("High") + pl.count("Medium")),
+            ("  of which High (2+ sites agree)", pl.count("High")),
+            ("Price unconfirmed (check)", pl.count("Low")), ("Price not found", pl.count("Not found")),
+            ("Skipped (PG listings)", labels.count("Skipped")),
+            ("Rule", "Confirmed = from RERA, 99acres/MagicBricks/Housing/Square Yards/PropTiger/Makaan etc. or the "
+                     "project's own site, on a page about this one project in this city. NoBroker never used."),
+        ]
     if mode == "rera":
         metrics += [("RERA date found", sum(1 for d in results.values() if d.get("rera_current_iso"))),
                     ("RERA extension found", sum(1 for d in results.values()
@@ -658,7 +1058,11 @@ def export(src: Path, sheet, df: pd.DataFrame, results: dict[int, dict], out_she
                                                           "Other Dates Seen": 35, "Claude Reasoning": 60,
                                                           "Claude Source": 45, "Claude Phase Note": 30,
                                                           "Extension / Revision": 40, "RERA Evidence": 60,
-                                                          "RERA Source": 45}.get(col, 18)
+                                                          "RERA Source": 45, "Possession Source URL": 45,
+                                                          "Possession Evidence": 50, "Price Source URL": 45,
+                                                          "Price Evidence": 50, "Other Prices Seen": 35,
+                                                          "Unconfirmed Possession Source": 40,
+                                                          "Unconfirmed Price Source": 40, "Note": 30}.get(col, 18)
                     ws.column_dimensions[c.column_letter].width = width
             log.info("Wrote %d rows to '%s' in %s", len(out), out_sheet, path.name)
             break
@@ -706,8 +1110,9 @@ def parse_args():
     p.add_argument("--lat-col"), p.add_argument("--lon-col"), p.add_argument("--rera-col")
     p.add_argument("--existing-col", help="Column holding possession dates you already have, to compare against")
     p.add_argument("--out-sheet", help="Tab to write results into (default: 'Results - <input tab>')")
-    p.add_argument("--mode", choices=["possession", "rera"], default="possession",
-                   help="possession = find possession date; rera = check RERA completion date / extensions by RERA ID")
+    p.add_argument("--mode", choices=["possession", "rera", "full"], default="possession",
+                   help="possession = find possession date; rera = check RERA completion date / extensions by RERA ID; "
+                        "full = possession date AND price, each with its source URL")
     p.add_argument("--workers", type=int, default=6, help="Buildings processed in parallel")
     p.add_argument("--max-queries", type=int,
                    help="Max searches per building (default 3; 4 in rera mode). Possession mode stops early when sure")
@@ -715,14 +1120,19 @@ def parse_args():
     p.add_argument("--max-pages", type=int, default=8, help="Max pages opened per building")
     p.add_argument("--start", type=int, default=0, help="First data row (0-based) to process")
     p.add_argument("--limit", type=int, help="Only process this many rows (for a test run)")
-    p.add_argument("--retry", choices=["missing", "low"],
-                   help="Re-scrape rows already done: 'missing' = not found, 'low' = not found or Low")
+    p.add_argument("--retry", choices=["missing", "low", "incomplete", "complete"],
+                   help="Re-scrape rows already done: 'missing' = not found, 'low' = not found or Low, "
+                        "'incomplete' (full mode) = possession or price not confirmed yet")
     p.add_argument("--browser", action="store_true", help="Use headless Chromium for pages that block scrapers")
     p.add_argument("--fallback-free", action="store_true",
                    help="When the paid search key runs out, carry on with free engines instead of stopping")
     p.add_argument("--backends", help="Comma list to restrict engines, e.g. bing,duckduckgo,serper")
     p.add_argument("--save-every", type=int, default=500, help="Write the sheet every N rows")
     p.add_argument("--export-only", action="store_true", help="Just write what's been scraped so far into the sheet")
+    p.add_argument("--budget", type=int,
+                   help="Stop after this many paid searches (credits) in this run; progress is saved")
+    p.add_argument("--no-proptiger", action="store_true",
+                   help="full mode: skip the free PropTiger lookup that runs before any paid search")
     p.add_argument("--exclude-domains", default="",
                    help="Comma list of sites to ignore as evidence, e.g. your own site: nobroker.in")
     p.add_argument("--redo-domain", help="Re-scrape rows already done whose evidence came from this site")
@@ -747,7 +1157,12 @@ def parse_args():
 
 
 async def run(args, src: Path, df: pd.DataFrame, cols: dict, store: Store, backup_done: list):
-    todo_idx = [i for i in range(args.start, len(df)) if i not in store.done_rows(args.retry)]
+    if args.retry == "complete":
+        # Re-check rows already marked complete with the current rules (cached searches: no credits).
+        todo_idx = sorted(store.done_rows("incomplete") - store.done_rows("skipped-only"))
+    else:
+        done = store.done_rows(args.retry)  # once - it parses every saved result
+        todo_idx = [i for i in range(args.start, len(df)) if i not in done]
     if args.limit:
         todo_idx = todo_idx[: args.limit]
     log.info("%d rows to scrape (%d already done)", len(todo_idx), len(store.done_rows(None)))
@@ -774,13 +1189,39 @@ async def run(args, src: Path, df: pd.DataFrame, cols: dict, store: Store, backu
                     res = store.all_results()
                     await asyncio.to_thread(export, src, args.sheet_name, df, res, args.out_sheet, backup_done,
                                             store.claude_all(), cols.get("existing"), args.mode,
-                                            args.summary_sheet)
+                                            args.summary_sheet, (cols.get("min_price"), cols.get("max_price")))
                     log.info("Engines so far: %s", search.stats())
 
-        queue: asyncio.Queue = asyncio.Queue()
+        # One search per distinct project: exports often repeat a project once per floor plan.
+        groups: dict[str, list] = {}
         for i in todo_idx:
             f = row_fields(df, cols, i)
-            queue.put_nowait((i, f["name"], f["loc"], f["city"], f["lat"], f["lon"], f["rera_ids"]))
+            k = row_key(f["name"], f["loc"], f["city"]) + "|" + ",".join(f["rera_ids"])
+            if k in groups:
+                groups[k][0].append(i)
+            else:
+                groups[k] = [[i], f["name"], f["loc"], f["city"], f["lat"], f["lon"], f["rera_ids"]]
+        log.info("%d distinct projects to search (%d rows are repeats of one of them)",
+                 len(groups), len(todo_idx) - len(groups))
+        order = list(groups.values())
+        if args.mode == "full" and args.max_queries:
+            # Spend credits where they pay off most: big-city projects (Google has portal pages for them)
+            # before small towns, and projects still missing a possession date before ones missing only a price.
+            prev = store.all_results()
+
+            def priority(g):
+                d = prev.get(g[0][0]) or {}
+                has_pos = bool(d.get("found") and d.get("label") in ("High", "Medium"))
+                metro = bool(city_from_coords(g[4], g[5]))
+                searched = bool(d.get("queries"))  # already had its paid search - redoing it finds nothing new
+                return (searched, not metro, has_pos)
+            order.sort(key=priority)
+            n_metro_pos = sum(1 for g in order if priority(g) == (False, False, False))
+            log.info("Paid-search order: %d big-city projects missing possession first, then the rest%s",
+                     n_metro_pos, f" | budget {args.budget} credits" if args.budget is not None else "")
+        queue: asyncio.Queue = asyncio.Queue()
+        for g in order:
+            queue.put_nowait(tuple(g))
         for _ in range(args.workers):
             queue.put_nowait(None)
         tasks = [asyncio.create_task(worker(ctx, queue, prog, export_cb)) for _ in range(args.workers)]
@@ -789,7 +1230,7 @@ async def run(args, src: Path, df: pd.DataFrame, cols: dict, store: Store, backu
         finally:
             for t in tasks:
                 t.cancel()
-            log.info("Engines: %s", search.stats())
+            log.info("Engines: %s | paid searches this run: %d", search.stats(), ctx.paid)
             if browser:
                 await browser.close()
 
@@ -817,7 +1258,7 @@ def main():
         args.sheet_name = args.sheet_name or xl.sheet_names[0]
         df = xl.parse(args.sheet_name, dtype=str, keep_default_na=False)
     if args.max_queries is None:
-        args.max_queries = 4 if args.mode == "rera" else 3
+        args.max_queries = {"rera": 4, "full": 1}.get(args.mode, 3)
     spath = store_path(src, args.sheet_name, args.mode)
     legacy = spath.name == f"{src.stem}.possession_cache.sqlite"
     args.out_sheet = (args.out_sheet or ("Possession Dates" if legacy else f"Results - {args.sheet_name or 'sheet'}"))[:31]
@@ -848,6 +1289,20 @@ def main():
             log.warning("Stopped by user - saving progress (re-run the same command to resume)")
         except AllBackendsDisabled as e:
             log.error("%s", e)
+        except BudgetReached:
+            log.error("=" * 70)
+            log.error("BUDGET REACHED: %d paid searches used - stopped and saved (%d of %d rows done).",
+                      args.budget, len(store.all_results()), len(df))
+            log.error("  To spend more, re-run the same command (each run gets a fresh --budget).")
+            log.error("=" * 70)
+            notify_user()
+        except PropTigerBlocked as e:
+            log.error("=" * 70)
+            log.error("PROPTIGER IS BLOCKING THIS CONNECTION (%s) - stopped and saved (%d of %d rows done).",
+                      e, len(store.all_results()), len(df))
+            log.error("  Wait an hour (or switch network / hotspot), then re-run the SAME command to continue.")
+            log.error("=" * 70)
+            notify_user()
         except CreditsExhausted as e:
             done = len(store.all_results())
             log.error("=" * 70)
@@ -864,7 +1319,7 @@ def main():
     if args.claude_dry_run:
         return
     export(src, args.sheet_name, df, store.all_results(), args.out_sheet, backup_done, store.claude_all(),
-           cols.get("existing"), args.mode, args.summary_sheet)
+           cols.get("existing"), args.mode, args.summary_sheet, (cols.get("min_price"), cols.get("max_price")))
 
 
 def run_claude(args, df: pd.DataFrame, cols: dict, store: Store):

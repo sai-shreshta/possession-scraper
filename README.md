@@ -1,109 +1,196 @@
-# Possession Date Scraper
+# Property Scrapers
 
-Reads a sheet of buildings (name, locality, city, lat, long), searches the web for each building's
-possession date, and writes a **Possession Dates** tab (plus a **Possession Summary** tab) back into the same workbook.
+Three tools in one folder:
 
-## Run
+| Tool | What it does |
+|---|---|
+| `possession_scraper.py` | For every building in a sheet (CSV or Excel), finds the **possession date**, the **price**, or the **RERA completion date / extension**, each with the source URL it came from. |
+| `hyd_discovery.py` | Finds **Hyderabad projects not yet on NoBroker**: from the Telangana RERA register and from 99acres / MagicBricks / Housing / Square Yards. |
+| `claude_verify.py` | Optional Claude review of unsure rows (not needed; kept for reference). |
+
+## Which command do I run?
+
+| I want... | Run |
+|---|---|
+| **Possession date + price for every row** (with source URLs) | [Full mode](#full-mode-possession--price) |
+| Possession date only | `python possession_scraper.py "file.xlsx" --sheet-name "tab"` |
+| RERA completion date, original vs revised, extension | `python possession_scraper.py "file.xlsx" --sheet-name "tab" --mode rera` |
+| Hyderabad projects that aren't on NoBroker | [Hyderabad discovery](#hyderabad-projects-not-on-nobroker) |
+| Just rewrite the Excel from what's been scraped so far | add `--export-only` to the same command |
+| Try something on a few rows first | add `--limit 50` |
+
+**Stop anytime with Ctrl+C. Re-run the same command and it continues where it stopped.** Searches already made are
+cached, so a re-run never pays for the same search twice.
+
+## Setup (once)
 
 ```
 pip install -r requirements.txt
-python possession_scraper.py "C:\path\to\buildings.xlsx"
 ```
 
-Columns are auto-detected (it prints the mapping at start). Override if needed:
-`--name-col "Project Name" --locality-col Area --city-col City --lat-col Lat --lon-col Lng`.
-Pick a tab with `--sheet-name`. Do a trial first: `--limit 50`.
+Create a `.env` file in this folder (see `.env.example`):
 
-**Stop anytime (Ctrl+C) and re-run the same command to resume.** Progress lives in
-`<sheet>.possession_cache.sqlite` next to your file. The sheet is re-written every 500 rows and at the end.
+```
+SERPER_API_KEY=your-serper-key
+```
 
-- Close the file in Excel while it runs. If it's open, results go to `<sheet>_possession_results.xlsx` instead.
-- A one-time backup `<sheet>.backup.xlsx` is made before the first write. openpyxl drops charts and images when it re-saves a workbook.
-- A CSV copy is always written: `<sheet>_possession_results.csv`.
+Serper.dev gives Google results and charges **1 credit per search**. When a key runs out, the run stops, saves,
+beeps and prints `SEARCH CREDITS USED UP`. Put a new key in `.env` and re-run the same command.
 
-## Output columns
+**Keep the laptop plugged in with the lid open.** While a run is going, the scraper keeps the screen on so Windows
+doesn't put the laptop into standby (Modern Standby laptops sleep when the screen turns off). Closing the lid still
+sleeps it, unless you set *Power Options → Choose what closing the lid does → Plugged in: Do nothing*. If it does
+sleep, nothing is lost: it continues when it wakes up.
+
+---
+
+## Full mode: possession + price
+
+Gets the **possession date** and the **price** for each row, each with **one source URL** and the exact text quoted
+from that page, so every value can be checked in one click.
+
+### Step 1: free pass (0 credits)
+
+```
+python possession_scraper.py "C:\path\to\file.csv" --mode full --max-queries 0
+```
+
+Looks every project up in PropTiger's own project data, which is free. A match is accepted only when the name matches
+and **either** the RERA number equals the sheet's, **or** it's within 3 km of the sheet's coordinates, **or** within
+8 km with a near-exact name and the sheet's locality in the address. Requests go one at a time, spaced out, because
+PropTiger blocks fast clients. If it starts refusing, the run pauses 10 minutes and tries again. After 6 pauses it
+stops and saves, so rows are never wrongly marked "not found". Expect about 40% of possession dates and about 15% of
+prices from this pass.
+
+### Step 2: paid pass with a credit cap
+
+```
+python possession_scraper.py "C:\path\to\file.csv" --mode full --retry incomplete --budget 15000
+```
+
+- `--retry incomplete` redoes only rows still missing a confirmed possession date **or** price.
+- `--budget 15000` stops after 15,000 paid searches and saves (`BUDGET REACHED`). To spend more later, run the same
+  command again with a new budget, e.g. `--budget 5000`. Cached searches don't count toward the budget.
+- **One search per project** (`--max-queries 1`, the default in full mode). Tested: one search finds almost all of
+  what three searches find.
+- **Order:** projects never searched before go first, then big-city projects before small towns, then rows missing a
+  possession date before rows missing only a price.
+- Rows that repeat a project (e.g. one row per floor plan) are searched once.
+- Measured: about **0.9 credits per project**, possession confirmed for about 80% of searched projects, price for
+  about 60%.
+
+You can skip step 1 and run step 2 directly. It still tries PropTiger first for each project and only pays when that
+doesn't confirm both values.
+
+### Step 3 (optional): re-check finished rows after a rule change
+
+```
+python possession_scraper.py "C:\path\to\file.csv" --mode full --retry complete --budget 0
+```
+
+Re-scores rows already marked complete using the cached searches. This costs no credits.
+
+### Output
+
+The results go to `<file>_Results_sheet.xlsx` and `.csv` next to the input file, or to a `Results - <tab>` tab for
+Excel input. They're re-written every 500 rows.
 
 | Column | Meaning |
 |---|---|
-| Possession Date | Best date found (e.g. `Dec 2025`), or `Not found` |
-| Possession (YYYY-MM) | Same date, sortable |
-| Project Status | Ready to Move / Under Construction (from the date) |
-| Confidence | **High**: multiple sites agree, or RERA or site data. **Medium**: likely. **Low**: weak, verify manually |
-| Sources Agreeing | Number of different websites giving that date |
-| RERA Date | RERA or official completion date, if seen (often later than the builder's date) |
-| Best Source / Evidence | URL and the exact text the date came from |
-| Other Dates Seen | Conflicting dates (phases or towers often differ) |
+| Possession Date / (YYYY-MM) / Project Status | Confirmed date only (High or Medium confidence) |
+| Possession Confidence | **High**: two trusted sites agree, or RERA / site data. **Medium**: one trusted site. **Low**: only unverified sites |
+| Possession Source URL / Possession Evidence | The page the date came from and the exact text |
+| Price, Price Min (Rs), Price Max (Rs), Price per sq.ft | Confirmed price only |
+| Price Confidence / Price Source URL / Price Evidence | Same idea for the price |
+| Sheet Completion Date, Web vs Sheet (date) | Compared with the sheet's `completionDate` / possession column |
+| Sheet Price, Web vs Sheet (price) | Compared with `longMinPrice` / `longMaxPrice` (within 15% = Match) |
+| Unconfirmed Possession / Price (check) + Source | Values seen **only** on unverified sites. They're kept apart so they're never mistaken for confirmed ones |
+| Other Dates Seen / Other Prices Seen | Conflicting values with their site |
 
-### Comparing with dates you already have
+### How it avoids wrong sources
 
-If the sheet has a `possession_date` column (or pass `--existing-col "Column Name"`), three more columns are added:
-**Sheet Possession Date**, **Web vs Sheet** (Match / Close (within 3 months) / Web is N months later or earlier /
-No web date / No sheet date), and **Difference (months)**. It compares against the Final date when Claude reviewed the
-row, otherwise the scraper's date. The totals appear on the Possession Summary tab.
+- **Never used:** nobroker.in (your own data), social media, YouTube, Quora, JustDial, Sulekha, Quikr, OLX, Wikipedia.
+- **Rejected pages:** list pages ("new projects in X", "flats for sale in X"), search results, single-unit resale listings,
+  builder pages, news, blog and update articles.
+- **The page must be about this one project:** the project name has to open the page title.
+- **Rejected if it looks like a different project:**
+  - the page names a different city;
+  - it quotes a different RERA number of the same format;
+  - it's a generic name ("Sai Residency") and the page doesn't mention the locality.
+- **Shown only as unconfirmed:**
+  - the page names a different sector (Gurgaon / Noida);
+  - the page's possession date is more than a year from the confirmed one;
+  - the price range is very wide (top more than 5× the bottom), which suggests mixed listings;
+  - the PropTiger price hasn't been updated in over 2 years.
+- **Prices on a page** count only when they're the page's own price data, or the project's **full** name comes right
+  before the amount with no "similar projects / nearby / you may also like" heading in between.
+- **Confirmed (High/Medium)** only from a RERA site, a major portal (99acres, MagicBricks, Housing, Square Yards,
+  PropTiger, Makaan and a few others), or the project's own website. Big portals are preferred for prices because
+  smaller sites often still show launch-time prices.
 
-## Speed and scale
+---
 
-With free engines only, expect about 10–20 buildings/min, so 25k rows is roughly 1–2 days of running. Engines that
-rate-limit are paused and retried automatically. For much faster and more reliable runs, add a search API key in `.env`
-(see `.env.example`). Serper.dev (Google results) works best. About 2–3 searches per building means roughly 60k queries for 25k rows.
-
-## Two modes, one tab at a time
+## Possession mode and RERA mode
 
 ```
 # Possession date + confidence
-python possession_scraper.py "C:\path\book.xlsx" --sheet-name "inactive blank" --exclude-domains nobroker.in
+python possession_scraper.py "C:\path\book.xlsx" --sheet-name "inactive blank"
 
-# RERA check: registered completion date, original -> revised, extension, compared with your possession_date
-python possession_scraper.py "C:\path\book.xlsx" --sheet-name "inactive >2yrs" --mode rera --exclude-domains nobroker.in
+# RERA: registered completion date, original -> revised, extension, compared with the sheet's possession_date
+python possession_scraper.py "C:\path\book.xlsx" --sheet-name "inactive >2yrs" --mode rera
 ```
 
-- Each tab gets its own `Results - <tab>` and `Summary - <tab>` tabs, and its own progress file, so the two runs never mix.
-- The city is taken from the address when there's no city column. Coordinates like `77.38° E` are fine.
-  Several RERA IDs in one cell (`ID1 | ID2`) are each searched.
-- RERA mode columns: **RERA Original Completion**, **RERA Current Completion**, **Extension / Revision**
-  ("Yes - extended X -> Y" or "No - revised date same as original"), **RERA vs Sheet**, the evidence and source.
-  Pages that quote the project's RERA ID are preferred over name matches.
+- Each tab gets its own `Results - <tab>` and `Summary - <tab>` tabs and its own progress file, so runs never mix.
+- Columns are auto-detected; the mapping is printed at start. Override with `--name-col`, `--locality-col`,
+  `--city-col`, `--lat-col`, `--lon-col`, `--rera-col`, `--existing-col`.
+- **City:** taken from the coordinates (nearest metro) when there's no city column, else from the address.
+- **Several RERA IDs in one cell:** `ID1 | ID2` and `ID1 I ID2` both work, and a trailing "dated ..." is ignored.
+- **Skipped:** PG listings. Bank-auction rows are searched by the building name.
+- **RERA mode columns:** RERA Original Completion, RERA Current Completion, Extension / Revision, RERA vs Sheet,
+  evidence and source.
+- **Credits:** about 1.3 credits per row in possession mode and about 3.7 in RERA mode. `--max-queries` lowers this.
+- **Excel:** close the file in Excel while it runs, otherwise results go to a separate file. A one-time
+  `<file>.backup.xlsx` is made before the first write.
 
-### Search credits and resuming
+---
 
-With `SERPER_API_KEY` set, only Serper is used. When the key runs out of credits (or is rejected), the run **stops,
-saves, beeps and prints `SEARCH CREDITS USED UP`**. Put a new key in `.env` and run the same command again: it continues
-where it stopped, and searches already made are reused without spending credits.
-Measured usage: about 1.3 credits per row in possession mode, about 3.7 in RERA mode (`--max-queries 3` lowers this).
-Add `--fallback-free` to switch to the free engines instead of stopping.
+## Hyderabad projects not on NoBroker
 
-## Claude review (optional second pass)
+Finds residential and commercial projects in the Hyderabad metro area (Hyderabad, Ranga Reddy, Medchal-Malkajgiri,
+Sangareddy and Yadadri Bhuvanagiri districts) within 3 km of an existing NoBroker project, that aren't on NoBroker's
+buy section yet. It needs `buildings.xlsx` (NoBroker's project list) in Downloads. Run the steps in this order:
 
-Claude reads the evidence the scraper collected for rows that aren't High confidence and decides the right date.
-It catches same-name projects elsewhere, phase/tower splits, and RERA-vs-builder dates.
+| Step | Command | What it does | Cost |
+|---|---|---|---|
+| 1 | `python hyd_discovery.py rera-list` | Opens the Telangana RERA site in a browser. **You solve the captcha** for each district; it then pages through the list | free |
+| 2 | `python hyd_discovery.py rera-details --workers 12` | Reads each project's RERA application/certificate PDF: type, address, PIN. Run it twice; the second run retries failures | free |
+| 3 | `python hyd_discovery.py listings` | Google searches restricted to 99acres / MagicBricks / Housing / Square Yards, per locality | ~1 credit per search, ~2,800 searches |
+| 4 | `python hyd_discovery.py enrich --only a` | Price and possession for RERA projects that weren't on the listing sites | 1 credit per project |
+| 5 | `python hyd_discovery.py build` | Writes `Downloads\Hyderabad projects not on NoBroker.xlsx` | free |
+| any | `python hyd_discovery.py status` | Shows how far each step got | free |
 
-1. Put `ANTHROPIC_API_KEY=sk-ant-...` in a `.env` file in this folder (see `.env.example`).
-2. Preview the prompt and cost without spending anything:
-   `python possession_scraper.py "C:\path\to\sheet.xlsx" --claude-only --claude-dry-run`
-3. Test on 20 rows: `... --claude-only --claude-limit 20`
-4. Full review: `... --claude-only --claude-budget 150` (or add `--claude` to a scraping run to review right after).
+The main tab is **All new projects**: name, builder, city, location, district, PIN, RERA ID, type, price, possession,
+where it was found, link, and the nearest NoBroker project with its distance. The optional `places` step (Google Maps)
+and `enrich --only b` add a separate, less reliable "B - Maps" tab.
 
-Adds these columns: Claude Date / Confidence / Status / Phase Note / Reasoning / Source, plus **Final Possession Date**
-(Claude's answer where it reviewed the row, otherwise the scraper's).
+---
 
-| Flag | Default | |
-|---|---|---|
-| `--claude-model` | `claude-opus-5` | `claude-sonnet-5` is ~2.5x cheaper, `claude-haiku-4-5` ~5x cheaper |
-| `--claude-scope` | `unsure` | `unsure` = Medium/Low/Not found, `notfound`, or `all` |
-| `--claude-budget` | `20` | Stops once this many USD are spent. Re-run with a higher value to continue |
-| `--claude-web` | off | Lets Claude do up to 3 of its own web searches per row (~$0.01 each + tokens) |
+## Claude review (optional, not needed)
 
-**Cheapest setup: Haiku + Batch API (half price, about $0.0015 per row measured):**
-```
-python possession_scraper.py "C:\path\to\sheet.xlsx" --claude-only --claude-model claude-haiku-4-5 --claude-batch
-```
-Batches finish in minutes to a few hours. You can close the window while it waits; re-run the same command to collect.
+`--claude`, `--claude-only`, `--claude-dry-run`, `--claude-model`, `--claude-batch` and `--claude-budget` let Claude
+review unsure rows using the evidence the scraper saved. Put `ANTHROPIC_API_KEY` in `.env` first. The cheapest setup is
+`--claude-only --claude-model claude-haiku-4-5 --claude-batch`, at about $0.0015 per row.
 
-Rough cost per reviewed row without web search, not using batch: Opus 5 about $0.04, Sonnet 5 about $0.017, Haiku 4.5 about $0.008.
-Reviews are saved as they go; re-running skips rows already reviewed.
+## Useful flags
 
-Useful flags:
-- `--workers 8`: more parallel buildings (default 6)
-- `--browser`: headless Chrome for sites that block plain requests (run `playwright install chromium` once)
-- `--retry missing` / `--retry low`: second pass over not-found / low-confidence rows
-- `--export-only`: write current progress into the sheet without scraping
+| Flag | Use |
+|---|---|
+| `--limit 50` | Trial run on the first 50 rows |
+| `--workers 8` | Projects in parallel (default 6) |
+| `--retry missing` / `low` / `incomplete` / `complete` | Redo not-found / low-confidence / not-fully-confirmed (full mode) / re-check finished rows |
+| `--budget N` | Stop after N paid searches in this run |
+| `--max-queries N` | Searches per project (full: 1, possession: 3, rera: 4; 0 = free sources only) |
+| `--no-proptiger` | Full mode: skip the free PropTiger lookup |
+| `--exclude-domains a.com,b.com` | Extra sites to ignore (nobroker.in is always ignored) |
+| `--browser` | Headless Chrome for sites that block plain requests (`playwright install chromium` once) |
+| `--export-only` | Just write the Excel from saved progress |

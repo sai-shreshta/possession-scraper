@@ -73,14 +73,23 @@ _STRUCT_RE = re.compile(
 
 DOMAIN_WEIGHT = {
     "housing.com": 0.9, "99acres.com": 0.9, "magicbricks.com": 0.9, "squareyards.com": 0.88,
-    "proptiger.com": 0.85, "makaan.com": 0.85, "nobroker.in": 0.82, "commonfloor.com": 0.78,
+    "proptiger.com": 0.85, "makaan.com": 0.85, "commonfloor.com": 0.78,
     "zricks.com": 0.8, "roofandfloor.com": 0.78, "anarock.com": 0.8, "homebazaar.com": 0.72,
-    "propequity.in": 0.8, "realestateindia.com": 0.6, "indiaproperty.com": 0.6, "propertywala.com": 0.6,
-    "dealacres.com": 0.6, "nobrokerage.com": 0.6, "quikr.com": 0.5, "sulekha.com": 0.5,
-    "justdial.com": 0.45, "keralarealestate.in": 0.6, "housiey.com": 0.75, "homznspace.com": 0.65,
-    "propsamc.com": 0.7, "squarefeetgroup.com": 0.6, "youtube.com": 0.3, "facebook.com": 0.3,
+    "propequity.in": 0.8, "realestateindia.com": 0.5, "indiaproperty.com": 0.5, "propertywala.com": 0.5,
+    "dealacres.com": 0.5, "nobrokerage.com": 0.5, "keralarealestate.in": 0.5, "housiey.com": 0.75,
+    "homznspace.com": 0.6, "propsamc.com": 0.6, "squarefeetgroup.com": 0.5,
 }
-DEFAULT_DOMAIN_WEIGHT = 0.55
+DEFAULT_DOMAIN_WEIGHT = 0.45
+# Portals whose project pages are maintained per project; a date/price from anywhere else is shown as unconfirmed.
+TRUSTED_PORTALS = ("housing.com", "99acres.com", "magicbricks.com", "squareyards.com", "proptiger.com", "makaan.com",
+                   "commonfloor.com", "housiey.com", "roofandfloor.com", "zricks.com", "anarock.com")
+# Never evidence: the user's own data (nobroker.in), social media, Q&A and classifieds.
+BLOCKED_HOSTS = ("nobroker.in", "youtube.com", "facebook.com", "instagram.com", "twitter.com", "x.com",
+                 "linkedin.com", "quora.com", "reddit.com", "pinterest.com", "pinterest.in", "t.me", "whatsapp.com",
+                 "justdial.com", "sulekha.com", "quikr.com", "olx.in", "wikipedia.org", "scribd.com",
+                 "slideshare.net", "threads.net")
+OFFICIAL_RERA_HOSTS = ("up-rera.in", "tnrera.in", "maharera.mahaonline.gov.in")
+MAJOR_PORTALS = ("housing.com", "99acres.com", "magicbricks.com", "squareyards.com", "proptiger.com", "makaan.com")
 
 GENERIC = set("""apartment apartments apts apt residency residences residence residential heights height
 tower towers enclave society chs cghs co op operative housing homes home villas villa project projects estate
@@ -106,11 +115,37 @@ def _host(url: str) -> str:
     return h[4:] if h.startswith("www.") else h
 
 
+def _on(h: str, domains) -> bool:
+    return any(h == d or h.endswith("." + d) for d in domains)
+
+
+def source_tier(url: str, matcher: "NameMatcher | None" = None) -> str:
+    """official | rera-mirror | portal | project-site | other | blocked."""
+    h = _host(url)
+    if _on(h, BLOCKED_HOSTS):
+        return "blocked"
+    if h.endswith(".gov.in") or h.endswith(".nic.in") or _on(h, OFFICIAL_RERA_HOSTS):
+        return "official"
+    if "rera" in h:
+        return "rera-mirror"  # reratracker.com, reragenie.com, ...: copies of the register, usually right
+    if _on(h, TRUSTED_PORTALS):
+        return "portal"
+    if matcher and len(matcher.anchor) >= 6 and matcher.anchor in h.replace("-", "").replace(".", ""):
+        return "project-site"  # e.g. prestigelakesidehabitat.com
+    return "other"
+
+
+TRUSTED_TIERS = ("official", "rera-mirror", "portal", "project-site")
+
+
 def domain_weight(url: str) -> tuple[float, bool]:
     """Returns (weight, is_government_or_rera)."""
     h = _host(url)
-    if "rera" in h or h.endswith(".gov.in") or h.endswith(".nic.in"):
+    tier = source_tier(url)
+    if tier == "official":
         return 1.0, True
+    if tier == "rera-mirror":
+        return 0.85, True
     for d, w in DOMAIN_WEIGHT.items():
         if h == d or h.endswith("." + d):
             return w, False
@@ -130,6 +165,10 @@ class NameMatcher:
         distinct = [t for t, w in self.tokens if w == 1.0] or [t for t, _ in self.tokens]
         self.anchor = max(distinct, key=len) if distinct else ""
         self.weak = sum(1 for _, w in self.tokens if w == 1.0) <= 1 and len(self.anchor) <= 5
+        # "Sai Residency": one distinctive word, shared by many buildings - the page must also name the place.
+        self.single = sum(1 for _, w in self.tokens if w == 1.0) <= 1
+        self.locality, self.city = norm(locality), norm(city)
+        self.raw_ids = [i for i in ids if len(re.sub(r"[^a-z0-9]", "", i.lower())) >= 6]
         self.places = []
         for p in (locality, city):
             n = norm(p)
@@ -162,6 +201,18 @@ class NameMatcher:
             s *= 0.6
         return s
 
+    def id_in(self, text: str) -> bool:
+        sq = norm(text).replace(" ", "")
+        return any(i in sq for i in self.ids)
+
+    def place_in(self, text: str) -> bool:
+        """The row's locality is mentioned ('Andheri West' matches 'Andheri (W)'); the city when there's no locality."""
+        words = set(norm(text).split())
+        loc = [t for t in self.locality.split() if len(t) >= 4 and t not in _PLACE_FILLER]
+        if loc:
+            return any(t in words for t in loc)
+        return bool(self.city) and self.city in norm(text)
+
     def anchor_positions(self, text_lower: str, limit: int = 60) -> list[int]:
         out, i = [], 0
         if not self.anchor:
@@ -173,6 +224,136 @@ class NameMatcher:
             out.append(i)
             i += len(self.anchor)
         return out
+
+
+# ----------------------------------------------------------------------------- source checks
+
+_PLACE_FILLER = {"east", "west", "north", "south", "road", "main", "nagar", "colony", "phase", "sector", "layout",
+                 "extension", "new", "old", "city", "town", "village", "stage", "block", "cross", "near"}
+
+# Names that mean "the same market"; a page naming only places from another group is about another city.
+CITY_REGIONS = {
+    "mumbai": ["mumbai", "bombay", "thane", "navi mumbai", "mira road", "mira bhayandar", "bhayandar", "kalyan",
+               "dombivli", "vasai", "virar", "panvel", "ulwe", "kharghar", "badlapur", "ambernath", "palghar",
+               "boisar", "karjat", "neral"],
+    "pune": ["pune", "pimpri", "chinchwad", "pimpri chinchwad", "pcmc"],
+    "bangalore": ["bangalore", "bengaluru"],
+    "hyderabad": ["hyderabad", "secunderabad", "cyberabad"],
+    "chennai": ["chennai", "madras"],
+    "ncr": ["delhi", "new delhi", "gurgaon", "gurugram", "noida", "greater noida", "ghaziabad", "faridabad",
+            "sonipat", "sohna", "bhiwadi", "dharuhera"],
+    "kolkata": ["kolkata", "calcutta", "howrah"],
+    "ahmedabad": ["ahmedabad", "gandhinagar"],
+    "tricity": ["chandigarh", "mohali", "zirakpur", "panchkula", "kharar"],
+    "kochi": ["kochi", "cochin", "ernakulam"],
+    "mysore": ["mysore", "mysuru"],
+    "vizag": ["visakhapatnam", "vizag"],
+    "vadodara": ["vadodara", "baroda"],
+    "trivandrum": ["thiruvananthapuram", "trivandrum"],
+    "mangalore": ["mangalore", "mangaluru"],
+    **{c: [c] for c in ["coimbatore", "jaipur", "lucknow", "indore", "bhopal", "nagpur", "nashik", "surat",
+                        "bhubaneswar", "vijayawada", "goa", "dehradun", "rajkot", "ludhiana", "patna", "ranchi",
+                        "raipur", "kanpur", "agra", "varanasi", "guntur", "nellore", "hubli", "madurai"]},
+}
+_ALL_CITY_NAMES = sorted({n for names in CITY_REGIONS.values() for n in names}, key=len, reverse=True)
+
+
+def city_names_for(city: str) -> set[str]:
+    c = norm(city)
+    if not c:
+        return set()
+    c2 = CITY_ALIASES.get(c, c)
+    for names in CITY_REGIONS.values():
+        if c in names or c2 in names:
+            return set(names)
+    return {c, c2}
+
+
+def city_conflict(text: str, city: str) -> bool:
+    """True when `text` names a city, none of which is the row's city (e.g. a Bangalore page for a Hyderabad row)."""
+    ours = city_names_for(city)
+    if not ours:
+        return False
+    nt = f" {norm(text)} "
+    if any(f" {n} " in nt for n in ours):
+        return False
+    return any(f" {n} " in nt for n in _ALL_CITY_NAMES if n not in ours)
+
+
+# Pages about many projects or single resale units: their dates/prices are not this project's.
+_AGGREGATE_URL = re.compile(
+    r"new-projects?-in|projects?-in-|flats?-for-sale|propert(?:y|ies)-for-sale|apartments?-for-sale"
+    r"|houses?-for-sale|villas?-for-sale|plots?-for-sale|for-sale-in|-pppfs|/property/buy/|for-rent|/rent/"
+    r"|/search|/srp|[?&](?:q|query|keyword)=|/builders?/|/developers?/|/localit(?:y|ies)/|-prjtl|/news/"
+    r"|/top-\d+|best-(?:projects|flats|apartments)|upcoming-projects|ready-to-move-(?:flats|projects|apartments)"
+    r"|under-construction-(?:flats|projects)|/compare|resale|/updates?/|/blogs?/|/articles?/", re.I)
+_AGGREGATE_TITLE = re.compile(
+    r"^\s*(?:\d+\+?\s+|top\s+\d*\s*|best\s+|new\s+|upcoming\s+|latest\s+|ready\s+to\s+move\s+|resale\s+"
+    r"|under\s+construction\s+)*(?:projects|flats|apartments|properties|property|homes|houses|villas|plots"
+    r"|\d\s*bhk|residential\s+projects)\b", re.I)
+
+
+def url_rejected(url: str) -> str:
+    """Cheap URL-only check, used before fetching. Returns the reason or ''."""
+    if source_tier(url) == "blocked":
+        return "blocked site"
+    if _AGGREGATE_URL.search(url) and "/buy/projects/page/" not in url:
+        return "list / search / resale page"
+    return ""
+
+
+def _id_shape(rid: str) -> re.Pattern:
+    """Regex matching other IDs of the same format: 'P51800012345' -> P\\d{11}."""
+    parts = re.findall(r"[A-Za-z]+|\d+|[^A-Za-z\d]+", rid)
+    rx = "".join(rf"\d{{{len(p)}}}" if p.isdigit() else (r"\s*[/\-]?\s*" if not p.isalnum() else re.escape(p))
+                 for p in parts)
+    return re.compile(rf"(?<![A-Za-z\d]){rx}(?!\d)", re.I)
+
+
+def rera_conflict(text: str, matcher: "NameMatcher") -> bool:
+    """The page quotes registration numbers of our format but never ours: another project or phase."""
+    if not matcher.raw_ids or matcher.id_in(text):
+        return False
+    return any(_id_shape(rid).search(text[:8000]) for rid in matcher.raw_ids)
+
+
+def reject_reason(url: str, title: str, text: str, matcher: "NameMatcher") -> str:
+    why = url_rejected(url)
+    if why:
+        return why
+    if _AGGREGATE_TITLE.search(title):
+        return "list page"
+    if city_conflict(f"{title} {url}", matcher.city):
+        return "different city"
+    if rera_conflict(text, matcher):
+        return "different RERA number"
+    if matcher.single and not matcher.place_in(f"{title} {url} {text[:6000]}"):
+        return "common name, locality not on page"
+    return ""
+
+
+_SECTOR = re.compile(r"\bsector (\d{1,3}[a-z]?)\b")
+
+
+def sector_conflict(text: str, matcher: "NameMatcher") -> bool:
+    """Row says Sector 41, page title/URL says Sector 30: probably a namesake in another sector."""
+    ours = set(_SECTOR.findall(matcher.locality))
+    theirs = set(_SECTOR.findall(norm(text)))
+    return bool(ours and theirs and not ours & theirs)
+
+
+def is_trusted(url: str, title: str, matcher: "NameMatcher") -> bool:
+    """Trusted site AND nothing on it hints at a namesake; otherwise its answer is shown only as unconfirmed."""
+    return source_tier(url, matcher) in TRUSTED_TIERS and not sector_conflict(f"{title} {url}", matcher)
+
+
+def is_dedicated(title: str, text: str, matcher: "NameMatcher") -> float:
+    """How surely the page is about this one project (0 = not). The name must open the title."""
+    head = title[:110]
+    s = matcher.score(head)
+    if matcher.id_in(text):
+        return 1.0 if s >= 0.5 else 0.0
+    return s if s >= 0.8 else 0.0
 
 
 # ----------------------------------------------------------------------------- date parsing
@@ -259,6 +440,8 @@ class Candidate:
     domain: str
     context: str
     is_rera: bool
+    trusted: bool = False   # RERA, a major portal, or the project's own site
+    origin: str = ""        # page / page data / search snippet
 
     @property
     def key(self) -> str:
@@ -290,18 +473,24 @@ def _statuses(text: str) -> Counter:
 
 
 def from_snippet(title: str, snippet: str, url: str, matcher: NameMatcher,
-                 pairs_out: list | None = None) -> tuple[list[Candidate], Counter]:
+                 pairs_out: list | None = None, prices_out: list | None = None) -> tuple[list[Candidate], Counter]:
     text = f"{title} . {snippet}"
+    if reject_reason(url, title, text, matcher) or city_conflict(text, matcher.city):
+        return [], Counter()
+    match = 1.0 if matcher.id_in(text) else matcher.score(title)
+    if match < 0.75:
+        return [], Counter()  # the result's title must be this project, not a list it appears in
     if pairs_out is not None:
         pairs_out += rera_pairs(text, url, matcher, title)
-    match = matcher.score(text)
-    if match < 0.6:
-        return [], Counter()
     dw, gov = domain_weight(url)
+    trusted = is_trusted(url, title, matcher)
     out = []
     for kind, _, pd, ctx in _keyword_hits(text):
         s = _KW_WEIGHT[kind] * dw * match * PREC_FACTOR[pd.precision] * 0.85
-        out.append(Candidate(pd.year, pd.month, pd.precision, kind, s, url, _host(url), ctx, gov or kind in RERA_KINDS))
+        out.append(Candidate(pd.year, pd.month, pd.precision, kind, s, url, _host(url), ctx,
+                             gov or kind in RERA_KINDS, trusted, "search snippet"))
+    if prices_out is not None:
+        prices_out += price_candidates(text, url, matcher, from_page=False, trusted=trusted)
     return out, _statuses(text)
 
 
@@ -341,61 +530,52 @@ def html_to_text(html: str) -> tuple[str, str]:
 
 
 def from_page(html: str, url: str, matcher: NameMatcher,
-              pairs_out: list | None = None) -> tuple[list[Candidate], Counter]:
+              pairs_out: list | None = None, prices_out: list | None = None) -> tuple[list[Candidate], Counter]:
+    """Only pages dedicated to this one project count. Lists, news roundups and other cities' namesakes are
+    skipped entirely - a date written next to the name on such pages too often belongs to a neighbour."""
     title, text = html_to_text(html)
+    if reject_reason(url, title, text, matcher):
+        return [], Counter()
+    title_match = is_dedicated(title, text, matcher)
+    if not title_match:
+        return [], Counter()
     if pairs_out is not None:
         pairs_out += rera_pairs(text, url, matcher, title)
-    title_match = matcher.score(title)
-    about_page = title_match >= 0.8
     dw, gov = domain_weight(url)
     host = _host(url)
+    trusted = is_trusted(url, title, matcher)
     out: list[Candidate] = []
-    statuses = Counter()
 
-    if about_page:
-        # Page is dedicated to this building: structured data and every keyword hit count.
-        n = 0
-        for m in _STRUCT_RE.finditer(html):
-            key, val = m.group(1).lower(), m.group(2).strip()
-            if "status" in key:
-                continue
-            pd = _epoch_date(val) if val.isdigit() and len(val) in (10, 13) else parse_first_date(val)
-            if not pd:
-                continue
-            s = dw * title_match * PREC_FACTOR[pd.precision]
-            out.append(Candidate(pd.year, pd.month, pd.precision, "structured", s, url, host,
-                                 f"{key}: {val}", gov or "rera" in key))
-            n += 1
-            if n >= 8:
-                break
-        hits = 0
-        anchors = matcher.anchor_positions(text.lower(), limit=300)
-        for kind, pos, pd, ctx in _keyword_hits(text):
-            # Dedicated pages still carry "similar projects" carousels; discount hits away from the name.
-            near = any(abs(pos - a) <= 300 for a in anchors) and \
-                matcher.score(text[max(0, pos - 300): pos + 300]) >= 0.6
-            s = _KW_WEIGHT[kind] * dw * title_match * PREC_FACTOR[pd.precision] * (1.0 if near else 0.4)
-            out.append(Candidate(pd.year, pd.month, pd.precision, kind, s, url, host, ctx, gov or kind in RERA_KINDS))
-            hits += 1
-            if hits >= 25:
-                break
-        statuses = _statuses(text[:20000])
-    else:
-        # Listing / news page: only trust dates written close to this building's name.
-        low = text.lower()
-        anchors = matcher.anchor_positions(low)
-        if not anchors:
-            return [], Counter()
-        for kind, pos, pd, ctx in _keyword_hits(text):
-            if not any(abs(pos - a) <= 250 for a in anchors):
-                continue
-            local = text[max(0, pos - 300): pos + 300]
-            lm = matcher.score(local)
-            if lm < 0.75:
-                continue
-            s = _KW_WEIGHT[kind] * dw * lm * PREC_FACTOR[pd.precision] * 0.75
-            out.append(Candidate(pd.year, pd.month, pd.precision, kind, s, url, host, ctx, gov or kind in RERA_KINDS))
-    return out, statuses
+    # Structured fields ("possessionDate": ...) - the first few belong to the page's own project;
+    # later ones are usually the "similar projects" widgets.
+    for n, m in enumerate(_STRUCT_RE.finditer(html)):
+        if n >= 3:
+            break
+        key, val = m.group(1).lower(), m.group(2).strip()
+        if "status" in key:
+            continue
+        pd = _epoch_date(val) if val.isdigit() and len(val) in (10, 13) else parse_first_date(val)
+        if not pd:
+            continue
+        s = dw * title_match * PREC_FACTOR[pd.precision]
+        out.append(Candidate(pd.year, pd.month, pd.precision, "structured", s, url, host,
+                             f"{key}: {val}", gov or "rera" in key, trusted, "page data"))
+    hits = 0
+    anchors = matcher.anchor_positions(text.lower(), limit=300)
+    for kind, pos, pd, ctx in _keyword_hits(text):
+        # Only dates written near this project's name; carousels of other projects are ignored.
+        if not (any(abs(pos - a) <= 300 for a in anchors)
+                and matcher.score(text[max(0, pos - 300): pos + 300]) >= 0.6):
+            continue
+        s = _KW_WEIGHT[kind] * dw * title_match * PREC_FACTOR[pd.precision]
+        out.append(Candidate(pd.year, pd.month, pd.precision, kind, s, url, host, ctx,
+                             gov or kind in RERA_KINDS, trusted, "page"))
+        hits += 1
+        if hits >= 25:
+            break
+    if prices_out is not None:
+        prices_out += price_candidates(text, url, matcher, from_page=True, html=html, trusted=trusted)
+    return out, _statuses(text[:20000])
 
 
 # ----------------------------------------------------------------------------- verdict
@@ -476,11 +656,14 @@ def aggregate(cands: list[Candidate], statuses: Counter) -> Verdict:
                     near += g2["score"]
         g["eff"] = g["score"] + 0.3 * near
 
-    ranked = sorted(groups.items(), key=lambda kv: kv[1]["eff"], reverse=True)
+    # A date backed by RERA / a major portal beats any amount of agreement among unknown sites.
+    ranked = sorted(groups.items(), key=lambda kv: (any(c.trusted for c in kv[1]["cands"]), kv[1]["eff"]),
+                    reverse=True)
     best_key, best = ranked[0]
     total = sum(g["score"] for g in groups.values()) or 1.0
     agreement = best["score"] / total
-    top = max(best["cands"], key=lambda c: c.score)
+    top = max(best["cands"], key=lambda c: (c.trusted, c.score))
+    trusted_domains = {c.domain for c in best["cands"] if c.trusted}
 
     v.found = True
     v.iso = best_key
@@ -488,10 +671,14 @@ def aggregate(cands: list[Candidate], statuses: Counter) -> Verdict:
     v.display = _display(top.year, top.month, top.precision)
     v.sources = len(best["domains"])
     v.best_url = top.url
-    v.evidence = top.context[:300]
+    v.evidence = f"[{top.origin or top.kind}] {top.context[:300]}"
     v.confidence = round(min(1.0, best["eff"] / 1.5) * (0.5 + 0.5 * agreement), 2)
-    strong_single = any(c.is_rera or c.kind == "structured" for c in best["cands"]) and top.score >= 0.7
-    if v.confidence >= 0.55 and (v.sources >= 2 or strong_single):
+    strong_single = any(c.trusted and (c.is_rera or c.kind == "structured") for c in best["cands"]) \
+        and top.score >= 0.7
+    if not trusted_domains:
+        v.label = "Low"
+        v.note = "only seen on unverified websites - check before using"
+    elif v.confidence >= 0.55 and (len(trusted_domains) >= 2 or strong_single):
         v.label = "High"
     elif v.confidence >= 0.3:
         v.label = "Medium"
@@ -540,4 +727,182 @@ def rera_summary(cands: list[Candidate], pairs: list[dict]) -> dict:
         if ext and out["extension_found"] == "Not found":
             b = max(ext, key=lambda c: c.score)
             out["extension_found"] = f"Mentioned: {b.context[:150]}"
+    return out
+
+
+# ----------------------------------------------------------------------------- price
+
+_U = r"(cr|crores?|crs?|lakhs?|lacs?|lac|l)\b"
+_NUM = r"(\d{1,3}(?:\.\d{1,2})?)"
+_RS = r"(?:₹|rs\.?|inr)"
+_PRICE_RANGE = re.compile(rf"{_RS}\s*{_NUM}\s*(?:{_U})?\s*(?:-|–|—|to)\s*{_RS}?\s*{_NUM}\s*{_U}", re.I)
+_PRICE_ONE = re.compile(rf"{_RS}\s*{_NUM}\s*{_U}(?!\s*(?:/|per)\s*(?:sq|month))", re.I)
+_PRICE_FULL = re.compile(rf"{_RS}\s*(\d{{1,3}}(?:,\d{{2,3}}){{2,4}})(?!\s*(?:/|per|\d))", re.I)
+_PER_SQFT = re.compile(rf"{_RS}\s*([\d,]{{3,7}}|\d+(?:\.\d+)?\s*k)\s*(?:/|per)\s*(?:sq\.?\s*ft|sqft|sq\.?\s*feet)",
+                       re.I)
+# Amounts that are not the flat's price.
+_NOT_PRICE = re.compile(r"\b(?:emi|booking|token|maintenance|registration|stamp|rent|deposit|charges?|gst|loan|income"
+                        r"|salary|turnover|revenue|invest|worth|valuation|project\s+cost|funding|raised|sales\s+of"
+                        r"|crore\s+project|deal|acquir)", re.I)
+_JSONLD_LOW = re.compile(r'"lowPrice"\s*:\s*"?(\d{5,})')
+_JSONLD_HIGH = re.compile(r'"highPrice"\s*:\s*"?(\d{5,})')
+MIN_PRICE, MAX_PRICE = 5e5, 1.5e9          # ₹5 L .. ₹150 Cr per unit
+_KIND_RANK = {"page data": 4, "range": 3, "onwards": 2, "single": 1}
+_CAROUSEL = re.compile(r"similar|you\s+may\s+(?:also\s+)?like|other\s+projects|nearby|recommended|also\s+viewed"
+                       r"|trending|newly\s+launched|more\s+projects|projects\s+(?:in|near|by)|top\s+projects|explore"
+                       r"|don.?t\s+miss|popular|featured|sponsored", re.I)
+
+
+@dataclass
+class PriceCand:
+    lo: float            # rupees
+    hi: float
+    kind: str            # range / page data / onwards / single
+    url: str
+    domain: str
+    trusted: bool
+    weight: float
+    origin: str
+    context: str
+    per_sqft: int = 0
+
+
+def _rupees(num: str, unit: str | None) -> float:
+    u = (unit or "").lower()
+    return float(num) * (1e7 if u.startswith("c") else 1e5)
+
+
+def fmt_inr(v: float) -> str:
+    if v >= 1e7:
+        return f"₹{v / 1e7:.2f}".rstrip("0").rstrip(".") + " Cr"
+    return f"₹{v / 1e5:.2f}".rstrip("0").rstrip(".") + " L"
+
+
+def _clean_ctx(text: str, a: int, b: int) -> str:
+    return re.sub(r"\s+", " ", text[max(0, a - 60): b + 40]).strip()
+
+
+def _price_ok_ctx(text: str, start: int, end: int) -> bool:
+    return not _NOT_PRICE.search(text[max(0, start - 45): start]) and not _NOT_PRICE.search(text[end: end + 14])
+
+
+def _sqft_values(text: str) -> list[tuple[int, int]]:
+    out = []
+    for m in _PER_SQFT.finditer(text):
+        raw = m.group(1).lower().replace(",", "").replace(" ", "")
+        v = int(float(raw[:-1]) * 1000) if raw.endswith("k") else int(float(raw))
+        if 1000 <= v <= 150000:
+            out.append((v, m.start()))
+    return out
+
+
+def price_candidates(text: str, url: str, matcher: NameMatcher, from_page: bool, html: str = "",
+                     trusted: bool | None = None) -> list[PriceCand]:
+    """Price quoted for this project on one page or snippet. On a page, an amount counts only when this
+    project's name comes shortly before it with no 'similar projects' style heading in between - pages
+    carry carousels of other projects, each with its own price."""
+    dw, _ = domain_weight(url)
+    if trusted is None:
+        trusted = source_tier(url, matcher) in TRUSTED_TIERS
+    host = _host(url)
+    origin = "page" if from_page else "search snippet"
+    anchor = matcher.anchor
+
+    def near(pos: int) -> bool:
+        # The whole name (not one word of it - "Green Valley" is not "Dhruv Valley") must come shortly before
+        # the amount, after any "similar projects"-style heading.
+        win = text[max(0, pos - 220): pos]
+        cuts = list(_CAROUSEL.finditer(win))
+        if not from_page and not cuts:
+            return True
+        k = win.lower().rfind(anchor) if anchor else -1
+        if k < 0 or (cuts and cuts[-1].start() > k):
+            return False
+        # the last mention before the amount must be this project's full name
+        return matcher.score(win[max(0, k - 45): k + len(anchor) + 45]) >= 0.8
+
+    sqft = [v for v, pos in _sqft_values(text) if near(pos)]
+    per = sorted(sqft)[len(sqft) // 2] if sqft else 0
+    out: list[PriceCand] = []
+    if from_page and html:
+        lo, hi = _JSONLD_LOW.search(html), _JSONLD_HIGH.search(html)
+        if lo and hi:
+            a, b = float(lo.group(1)), float(hi.group(1))
+            if MIN_PRICE <= a <= b <= MAX_PRICE:
+                out.append(PriceCand(a, b, "page data", url, host, trusted, dw, "page data",
+                                     f"lowPrice {lo.group(1)} / highPrice {hi.group(1)}", per))
+    for m in _PRICE_RANGE.finditer(text):
+        if not near(m.start()) or not _price_ok_ctx(text, m.start(), m.end()):
+            continue
+        a, b = _rupees(m.group(1), m.group(2) or m.group(4)), _rupees(m.group(3), m.group(4))
+        if MIN_PRICE <= a <= b <= MAX_PRICE:
+            out.append(PriceCand(a, b, "range", url, host, trusted, dw, origin,
+                                 _clean_ctx(text, m.start(), m.end()), per))
+            break  # the first range near the name is the headline price
+    if not any(c.kind == "range" for c in out):
+        singles = []
+        for m in _PRICE_ONE.finditer(text):
+            if near(m.start()) and _price_ok_ctx(text, m.start(), m.end()):
+                v = _rupees(m.group(1), m.group(2))
+                if MIN_PRICE <= v <= MAX_PRICE:
+                    singles.append((v, m))
+        for m in _PRICE_FULL.finditer(text):
+            if near(m.start()) and _price_ok_ctx(text, m.start(), m.end()):
+                v = float(m.group(1).replace(",", ""))
+                if MIN_PRICE <= v <= MAX_PRICE:
+                    singles.append((v, m))
+        if singles:
+            singles = singles[:6]
+            v0, m0 = singles[0]
+            onwards = re.search(r"onwards|starting|starts?\s+(?:at|from)|from", text[max(0, m0.start() - 25): m0.end() + 15],
+                                re.I)
+            lo, hi = min(v for v, _ in singles), max(v for v, _ in singles)
+            kind = "onwards" if onwards else "single"
+            out.append(PriceCand(lo, hi if kind == "single" else lo, kind, url, host, trusted, dw, origin,
+                                 _clean_ctx(text, m0.start(), m0.end()), per))
+    if not out and per:
+        out.append(PriceCand(0, 0, "per sq.ft only", url, host, trusted, dw, origin, f"₹{per:,}/sq.ft", per))
+    return out
+
+
+def aggregate_price(cands: list[PriceCand]) -> dict:
+    """Best price with one source URL. High = two trusted sites agree (within 20%); Medium = one trusted site."""
+    out = {"price_display": "", "price_min": "", "price_max": "", "price_sqft": "", "price_label": "Not found",
+           "price_url": "", "price_evidence": "", "price_alternatives": ""}
+    full = [c for c in cands if c.lo]
+    sqft = [c for c in cands if c.per_sqft and c.trusted] or [c for c in cands if c.per_sqft]
+    if not full and not sqft:
+        return out
+    for c in full:
+        if c.trusted and c.hi > 5 * c.lo:
+            # "Rs 2.75 - 16.8 Cr": a spread like that mixes several listings, not one project's price list
+            c.trusted = False
+            c.context = f"(very wide range - may mix other listings) {c.context}"
+    if full:
+        # Big portals keep current prices; smaller sites often still show launch-time prices.
+        best = max(full, key=lambda c: (c.trusted, _on(c.domain, MAJOR_PORTALS), _KIND_RANK.get(c.kind, 0),
+                                        c.origin != "search snippet", c.weight))
+        agree = {c.domain for c in full if c.trusted and c.domain != best.domain
+                 and abs(c.lo - best.lo) <= 0.2 * best.lo}
+        if not best.trusted:
+            label = "Low"
+        elif agree:
+            label = "High"
+        else:
+            label = "Medium"
+        disp = (f"{fmt_inr(best.lo)} - {fmt_inr(best.hi)}" if best.hi > best.lo * 1.02
+                else f"{fmt_inr(best.lo)} onwards" if best.kind == "onwards" else fmt_inr(best.lo))
+        per = best.per_sqft or (sqft[0].per_sqft if sqft else 0)
+        others, seen = [], {best.domain}
+        for c in sorted(full, key=lambda c: -c.weight):
+            if c.domain not in seen:
+                seen.add(c.domain)
+                others.append(f"{fmt_inr(c.lo)}{' - ' + fmt_inr(c.hi) if c.hi > c.lo * 1.02 else ''} ({c.domain})")
+        out.update(price_display=disp, price_min=int(best.lo), price_max=int(best.hi), price_label=label,
+                   price_url=best.url, price_evidence=f"[{best.origin}] {best.context[:250]}",
+                   price_sqft=f"₹{per:,}/sq.ft" if per else "", price_alternatives="; ".join(others[:4]))
+    else:
+        b = max(sqft, key=lambda c: (c.trusted, c.weight))
+        out.update(price_sqft=f"₹{b.per_sqft:,}/sq.ft", price_label="Medium" if b.trusted else "Low",
+                   price_url=b.url, price_evidence=f"[{b.origin}] {b.context}")
     return out
