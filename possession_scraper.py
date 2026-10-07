@@ -1037,6 +1037,8 @@ def export(src: Path, sheet, df: pd.DataFrame, results: dict[int, dict], out_she
         targets.append((src, "a"))
     tag = re.sub(r"[^A-Za-z0-9]+", "_", out_sheet).strip("_")
     targets.append((src.with_name(f"{src.stem}_{tag}.xlsx"), "w"))
+    # Last resort when that file is open in Excel: a new file with the time in its name.
+    targets.append((src.with_name(f"{src.stem}_{tag} {datetime.now():%Y-%m-%d %H%M}.xlsx"), "w"))
 
     for path, mode in targets:
         try:
